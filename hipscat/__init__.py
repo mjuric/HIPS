@@ -27,24 +27,15 @@ def parse_source_data(url='https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/cs
 
     try:
         http = httplib2.Http()
-        print("Attempting to establish connection with the Data Source")
         status, response = http.request('https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/csv/')
-        print("Succesfully created the connection")
-
     except requests.exceptions.HTTPError as err:
         raise SystemExit(err)
     
-    print("**********Parsing STARTED *******")
     for link in BeautifulSoup(response, parse_only=SoupStrainer('a'), features="html.parser"):
-        
-        if link.has_attr('href'):
-            if (link['href'].endswith('.csv.gz')):
-                abs_path = url + link['href']
-                csv_files.append(abs_path)
-            else:
-                pass
-    print("**********Parsing ENDED *********")
-    #return csv_files
+        if link.has_attr('href') and link['href'].endswith('.csv.gz'):
+            abs_path = url + link['href']
+            csv_files.append(abs_path)
+
     return pd.DataFrame(csv_files, columns=['Gaia_file_paths'])
 
 def to_hips(long,lat):
