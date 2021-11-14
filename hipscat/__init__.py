@@ -5,6 +5,7 @@
 import healpy as hp
 import pandas as pd
 import numpy as np
+import requests
 import os
 import csv
 import time
@@ -25,6 +26,7 @@ def parse_source_data(url='https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/cs
     csv_files = []
 
     try:
+        http = httplib2.Http()
         print("Attempting to establish connection with the Data Source")
         status, response = http.request('https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/csv/')
         print("Succesfully created the connection")
@@ -94,7 +96,6 @@ def csv_to_hips_2(df_csv, k=5):
                 df_temp.to_csv(abs_path, mode='a', header=False)
 
 if __name__ == "__main__":
-    http = httplib2.Http()
     file_paths = parse_source_data()
 
     test_data  = file_paths.head(100)
