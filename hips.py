@@ -14,8 +14,6 @@ from bs4 import BeautifulSoup, SoupStrainer
 from csv import writer
 
 
-http = httplib2.Http()
-
 def parse_source_data(url='https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/csv/'):
     """
     This function parses the source url 'https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/csv/'
@@ -46,8 +44,6 @@ def parse_source_data(url='https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/cs
     print("**********Parsing ENDED *********")
     #return csv_files
     return pd.DataFrame(csv_files, columns=['Gaia_file_paths'])
-
-file_paths = parse_source_data()
 
 def to_hips(long,lat):
     """
@@ -96,10 +92,10 @@ def csv_to_hips_2(df_csv, k=5):
             else:
                 abs_path = dir_path + 'catalog.csv'
                 df_temp.to_csv(abs_path, mode='a', header=False)
-                
 
-test_data  = file_paths.head(100)
-csv_to_hips_2(df_csv=test_data, k=5)
+if __name__ == "__main__":
+    http = httplib2.Http()
+    file_paths = parse_source_data()
 
-
-
+    test_data  = file_paths.head(100)
+    csv_to_hips_2(df_csv=test_data, k=5)
