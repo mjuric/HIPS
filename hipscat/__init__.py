@@ -1,42 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-
 import healpy as hp
 import pandas as pd
 import numpy as np
-import requests
 import os
 import csv
 import time
 import errno
-import httplib2
-from bs4 import BeautifulSoup, SoupStrainer
 from csv import writer
-
-
-def parse_source_data(url='https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/csv/'):
-    """
-    This function parses the source url 'https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/csv/'
-    for .csv.gz files and appends them to the list
-
-    :param url: the source url from where the Gaia data needs to be downloaded
-    :return: list object with file names
-    """
-    csv_files = []
-
-    try:
-        http = httplib2.Http()
-        status, response = http.request('https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/csv/')
-    except requests.exceptions.HTTPError as err:
-        raise SystemExit(err)
-    
-    for link in BeautifulSoup(response, parse_only=SoupStrainer('a'), features="html.parser"):
-        if link.has_attr('href') and link['href'].endswith('.csv.gz'):
-            abs_path = url + link['href']
-            csv_files.append(abs_path)
-
-    return pd.DataFrame(csv_files, columns=['Gaia_file_paths'])
 
 def to_hips(long,lat):
     """
