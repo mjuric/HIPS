@@ -35,7 +35,7 @@ def parse_source_data(url='https://cdn.gea.esac.esa.int/Gaia/gdr2/gaia_source/cs
         raise SystemExit(err)
     
     print("**********Parsing STARTED *******")
-    for link in BeautifulSoup(response, parse_only=SoupStrainer('a')):
+    for link in BeautifulSoup(response, parse_only=SoupStrainer('a'), features="html.parser"):
         
         if link.has_attr('href'):
             if (link['href'].endswith('.csv.gz')):
