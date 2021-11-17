@@ -79,18 +79,25 @@ def _merge_worker(idx, hipsPath, outFn, format):
     dir = os.path.join(hipsPath, pix2subdir(k, pix))
     destFn = os.path.join(dir, f'{outFn}.{format}')
 
-    for fn in glob.glob(os.path.join(dir, 'import.*.pkl')):
-        df = pd.read_pickle(fn)
-        
-        if format == 'csv':
-            df.to_csv(destFn, mode='a', index=False, header=not os.path.exists(destFn))
-        elif format == 'h5':
-            df.to_hdf(destFn, mode='a', key='catalog', append=True, format='table', complib='blosc:lz4', complevel=9)
-        else:
-            raise Exception(f"Unknown format '{format}'")
+    # load and merge temp files
+    files = glob.glob(os.path.join(dir, 'import.*.pkl'))
+    df = pd.concat( pd.read_pickle(fn) for fn in files )
+
+    # write out in the desired format
+    if format == 'csv':
+        df.to_csv(destFn, mode='a', index=False, header=not os.path.exists(destFn))
+    elif format == 'h5':
+        df.to_hdf(destFn, mode='a', key='catalog', append=True, format='table', complib='blosc:lz4', complevel=9)
+    elif format == 'parquet':
+        df.to_parquet(destFn)
+    else:
+        raise Exception(f"Unknown format '{format}'")
+
+    # delete temp files
+    for fn in files:
         os.unlink(fn)
 
-def csv2hips(hipsPath, urls, k=5, format='csv'):
+def csv2hips(hipsPath, urls, k=6, format='csv'):
     """
     Convert a list of URLs to CSV files (may be local files) to a HiPS file
     of a given order k.
@@ -142,8 +149,10 @@ def main():
     from .util import get_gaia_csv_urls
     urls = get_gaia_csv_urls()
     print(f"Number of input files {len(urls)}")
-    urls = urls[:5000]
+#    import random
+#    random.shuffle(urls)
+    urls = urls[:25000]
 
-    summary = csv2hips('output', urls, format='h5')
+    summary = csv2hips('output', urls, format='parquet')
     print(summary)
     print(f'Total rows imported: {summary.sum()}')
