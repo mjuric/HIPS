@@ -58,7 +58,10 @@ def df2hips(hipsPath, df, k, outFn='catalog.csv', format='csv'):
 
 ########################
 
-def _partition_worker(url, hipsPath, k):
+import dask
+
+@dask.delayed
+def _partition_inputs(url, hipsPath, k):
     # A function loads a file from an URL and writes out a series of
     # files into hipsPath named 'import.<url_basename>'. This guarantees
     # no other instance of _partition_worker will try to write to the same
@@ -71,7 +74,8 @@ def _partition_worker(url, hipsPath, k):
     ret = df2hips(hipsPath, df, k=k, outFn=outFn, format='pkl')
     return ret
 
-def _merge_worker(idx, hipsPath, outFn, format):
+@dask.delayed
+def _compactify_partitions(idx, hipsPath, outFn, format):
     # for a given idx=(k, pix), list all 'import.*' files and merge them
     # into outFn (usually catalog.csv). Delete the import.* files once
     # the merge is done.
@@ -97,6 +101,7 @@ def _merge_worker(idx, hipsPath, outFn, format):
     for fn in files:
         os.unlink(fn)
 
+
 def csv2hips(hipsPath, urls, k=6, format='csv'):
     """
     Convert a list of URLs to CSV files (may be local files) to a HiPS file
@@ -108,36 +113,31 @@ def csv2hips(hipsPath, urls, k=6, format='csv'):
 
     :return: Number of records written to each HiPS file
     """
-    from functools import partial
-    from multiprocessing import Pool
+    from functools import reduce
+    
+    from dask.distributed import Client, progress, as_completed
+    c = Client(n_workers=12, threads_per_worker=1, memory_limit='16GB')
+    print(c)
 
+    #
+    # Stage #1: Import files in parallel, each into its own leaf .csv file
+    #
+    stage1 = c.compute([ _partition_inputs(url, hipsPath=hipsPath, k=k) for url in urls ])
+    prog = tqdm(as_completed(stage1, with_results=True), total=len(urls))
     summary = None
-    # FIXME: the level of parallelization should be user-settable
-    with Pool(12) as pool:
-        #
-        # Stage #1: Import files in parallel, each into its own leaf .csv file
-        #
-        worker = partial(_partition_worker, hipsPath=hipsPath, k=k)
-        prog = tqdm(pool.imap_unordered(worker, urls), total=len(urls))
-        for ret in prog:
-            # Keep track of how many rows we've imported into
-            # each individual HiPS file
-            if summary is None:
-                summary = ret
-            else:
-                # FIXME: this changes the datatype to float... grrr...
-                summary = summary.add(ret, fill_value=0).astype(int)
+    for _, df in prog:
+            # FIXME: this changes the datatype to float... grrr...
+            summary = summary.add(df, fill_value=0).astype(int) if summary is not None else df
 
-            # progress update
-            prog.set_postfix({'rows imported': summary.sum()})
+            # give us the number of rows imported
+            prog.set_postfix({'rows imported': int(summary.sum())})
 
-        #
-        # Stage #2: Merge the individual files into a single catalog.csv file
-        #
-        worker = partial(_merge_worker, hipsPath=hipsPath, outFn='catalog', format=format)
-        prog = tqdm(pool.imap_unordered(worker, summary.index), total=len(summary))
-        for _ in prog:
-            pass
+    #
+    # Stage #2: Merge the individual leaf files into a single file per partition
+    #
+    stage2 = c.compute([ _compactify_partitions(idx, hipsPath=hipsPath, outFn='catalog', format=format) for idx in summary.index ])
+    for _ in tqdm(as_completed(stage2), total=len(summary)):
+        pass
 
     return summary
 
@@ -149,8 +149,8 @@ def main():
     from .util import get_gaia_csv_urls
     urls = get_gaia_csv_urls()
     print(f"Number of input files {len(urls)}")
-#    import random
-#    random.shuffle(urls)
+##    import random
+##    random.shuffle(urls)
     urls = urls[:25000]
 
     summary = csv2hips('output', urls, format='parquet')
