@@ -47,27 +47,35 @@ def _to_hips(df, hipsPath, outFn='catalog', format='csv'):
 def df2hips(hipsPath, df, k, outFn='catalog.csv', format='csv'):
     # Dataframe-to-hips: write out a dataframe as a HiPS file of a given order
     # FIXME: rewrite this implementation so it doesn't modify the input dataframe
-
     # FIXME: write a proper docstring
-    df['hips_k'] = k
-    df['hips_pix'] = hp.ang2pix(2**k, df['ra'].values, df['dec'].values, lonlat=True)
+
+    orders = k
+    k = hp.npix2order(len(orders))
+
+    pix = hp.ang2pix(2**k, df['ra'].values, df['dec'].values, nest=True, lonlat=True)
+    df['hips_k'] = orders[pix]
+    df['hips_pix'] = pix >> 2*(k-df['hips_k'])
 
     # returns the number of records written to each HiPS file
     return df.groupby(['hips_k', 'hips_pix']).apply(_to_hips, hipsPath=hipsPath, outFn=outFn, format=format)
-
 
 ########################
 
 import dask
 
 @dask.delayed
-def _partition_inputs(url, hipsPath, k):
+def _partition_inputs(url, hipsPath, k, in_format):
     # A function loads a file from an URL and writes out a series of
     # files into hipsPath named 'import.<url_basename>'. This guarantees
     # no other instance of _partition_worker will try to write to the same
     # file. These filles will be merged by _merge_worker() in a separate
     # pass.
-    df = pd.read_csv(url)
+    if in_format == 'csv':
+        df = pd.read_csv(url)
+    elif in_format == 'parquet':
+        df = pd.read_parquet(url)
+    else:
+        raise Exception(f"Unknown input format '{in_format}'")
 
     # write the file into 'catalog-Gaia...csv.gz' named files
     outFn = 'import.' + os.path.basename(url)
@@ -102,7 +110,7 @@ def _compactify_partitions(idx, hipsPath, outFn, format):
         os.unlink(fn)
 
 
-def csv2hips(hipsPath, urls, k=6, format='csv'):
+def csv2hips(hipsPath, urls, k=6, format='csv', in_format='csv'):
     """
     Convert a list of URLs to CSV files (may be local files) to a HiPS file
     of a given order k.
@@ -116,13 +124,15 @@ def csv2hips(hipsPath, urls, k=6, format='csv'):
     from functools import reduce
     
     from dask.distributed import Client, progress, as_completed
-    c = Client(n_workers=12, threads_per_worker=1, memory_limit='16GB')
-    print(c)
+    c = Client(n_workers=48, threads_per_worker=1)
+
+    # upload the partition map to the workers
+    k = c.scatter(k, broadcast=True)
 
     #
     # Stage #1: Import files in parallel, each into its own leaf .csv file
     #
-    stage1 = c.compute([ _partition_inputs(url, hipsPath=hipsPath, k=k) for url in urls ])
+    stage1 = c.compute([ _partition_inputs(url, hipsPath=hipsPath, k=k, in_format=in_format) for url in urls ])#, scheduler='single-threaded')
     prog = tqdm(as_completed(stage1, with_results=True), total=len(urls))
     summary = None
     for _, df in prog:
@@ -145,14 +155,22 @@ def main():
     # HACK: for quick tests, run python -m hipscat
 #    import glob
 #    urls = glob.glob('./gdr2/*.csv.gz')
+#    urls = glob.glob('/data2/epyc/data/gaia_edr3_csv/*.csv.gz')
+    urls = glob.glob('cache/*.parquet')
+#    urls = urls[:1000]
 
-    from .util import get_gaia_csv_urls
-    urls = get_gaia_csv_urls()
+#    from .util import get_gaia_csv_urls
+#    urls = get_gaia_csv_urls()
     print(f"Number of input files {len(urls)}")
 ##    import random
 ##    random.shuffle(urls)
-    urls = urls[:25000]
+##    urls = urls[:250]
+#    print(urls); exit(0);
 
-    summary = csv2hips('output', urls, format='parquet')
+    import pickle
+    with open('output/orders.hpix10.pkl', 'rb') as fp:
+        opix, orders = pickle.load(fp)
+
+    summary = csv2hips('output', urls, k=orders, format='parquet', in_format='parquet')
     print(summary)
     print(f'Total rows imported: {summary.sum()}')
