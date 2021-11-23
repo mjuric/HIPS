@@ -6,3 +6,7 @@ tqdm
 requests
 ipython
 jupyter 
+dask
+python-graphviz
+pyarrow
+mamba
