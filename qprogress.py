@@ -81,6 +81,8 @@ class progress:
         # (example: length=10 would be passed to all progress bars, but length2=10 only to
         # progress bar #2). The counting starts at 1.
         #
+        assert len(queues) # must be at least one
+
         self._gen = _communicate(b, *queues)
         self._queues = queues
         self._retval = None
