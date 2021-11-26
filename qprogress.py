@@ -5,6 +5,23 @@ from functools import wraps
 from tqdm import tqdm as con_tqdm
 from tqdm.notebook import tqdm as nb_tqdm
 
+def log(*args):
+    # infer message key
+    if len(args) == 1:
+        key = 'default'
+    else:
+        key, args = args[0], args[1:]
+
+    # get the queue object
+    import dask
+    try:
+        q = dask._default_q
+    except AttributeError:
+        q = dask._default_q = Queue('_default_q')
+
+    # post the message
+    q.put((key, args[0]))
+
 class CaptureReturnValueGenerator:
     # Wraps a generator to store its return value in
     # self._retval. See https://stackoverflow.com/a/34073775 for
@@ -25,7 +42,7 @@ def capture_value(f):
     return g
 
 @capture_value
-def _communicate(b, *queues):
+def _communicate(b):
     # intented to be used by class progress.
     #
     # given a dask-computable object b, and dask.Queue objects queues,
@@ -38,7 +55,9 @@ def _communicate(b, *queues):
 
     fut = get_client().compute(b)
 
-    timeout = 0.1  # internal timeout
+    q = Queue('_default_q')
+
+    _timeout = 0.1  # internal timeout
     while True:
         try:
             # check if we're done. we do this first to
@@ -47,27 +66,24 @@ def _communicate(b, *queues):
             done = fut.done()
 
             # wait for a next message in all queues
-            if len(queues) == 1:
-                msgs = queues[0].get(timeout=timeout, batch=True)
-                yield from msgs
-            else:
-                for q in queues:
-                    msgs = q.get(timeout=timeout, batch=True)
-                    yield q, msgs
+            msgs = q.get(timeout=_timeout, batch=True)
+            #print("XXXXXXXXXXXX:", msgs)
+            for key, msg in msgs:
+                yield key, msg
+
             if done:
                 break
         except TimeoutError:
             pass
 
-    for q in queues:
-        assert q.qsize() == 0
+    assert q.qsize() == 0
 
     return fut
 
 class progress:
     _prog = None
 
-    def __init__(self, b, *queues, tqdm=None, **kwargs):
+    def __init__(self, b, keys=set(), tqdm=None, kv=False, **kwargs):
         #
         # Display one or more progress bars to display the progress of execution of b via
         # messagess arriving on queues.
@@ -75,17 +91,17 @@ class progress:
         # b: dask-computable object to compute
         # queues: the queues on which to listen for messages until b is computed
         # tqdm: tqdm-compatible class to use for progress bar (None autoselect an apropriate one)
+        # kv: return msg value or (k, v) tuple
         #
         # kwargs are passed on to tqdm's constructor. If there are multiple queues, then
         # any kwargs with a number suffix are passed into only that tqdm bar's constructor.
         # (example: length=10 would be passed to all progress bars, but length2=10 only to
         # progress bar #2). The counting starts at 1.
         #
-        assert len(queues) # must be at least one
-
-        self._gen = _communicate(b, *queues)
-        self._queues = queues
+        self._gen = _communicate(b)
         self._retval = None
+        self._kv = kv
+        self._keys = set(keys)
 
         # select tqdm class
         if tqdm is None:
@@ -95,45 +111,60 @@ class progress:
 
         # set up progres bar configs
         self._configs = {}
-        for i, q in enumerate(queues):
-            cfg = self._configs[q.name] = dict(position=i)
+        self._config_default = kwargs
 
-            # apply kwargs configs
-            suffix = str(i+1)
-            for kw, val in kwargs.items():
-                if kw.endswith(suffix):
-                    kw = kw[:-len(suffix)]
-                elif kw[-1].isdigit():
-                    continue
-                cfg[kw] = val
+    def config(self, name, **kwargs):
+        cfg = self._configs[name] = self._config_default.copy()
+        cfg.update(kwargs)
+        return self
+
+    def _new_pbar(self, name, position):
+        try:
+            cfg = self._configs[name]
+        except KeyError:
+            cfg = self._config_default.copy()
+
+        if 'desc' not in cfg:
+            cfg['desc'] = name if name != 'default' else "Progress"
+
+        return self.tqdm(position=position, **cfg)
 
     def __iter__(self):
-        if len(self._queues) == 1:
-            # a single progress bar is simple & fast
-            self._prog = self.tqdm(self._gen, **next(iter(self._configs.values())))
-            yield from self._prog
-            self._prog.refresh()
-            self._prog.close()
+        # start with the pre-defined progress bars,
+        # and only those listed in self._keys (if non-empty)
+        keys = self._keys
+        if not keys:
+            configs = self._configs
         else:
-            # create the progress bars
-            pbars = {}
-            #print(self._configs)
-            for k, vals in self._configs.items():
-                pbars[k] = self.tqdm(**vals)
+            # trim configs to allowed keys only
+            configs = { k: v for k, v in self._configs.items() if k in keys }
+        # create new progress bars, from the given configs
+        pbars = {}
+        for i, name in enumerate(configs):
+            pbars[name] = self._new_pbar(name, i)
 
-            # yield from the iterator
-            # in this variant, self._gen returns q, [msg1, msg2, ...]
-            for q, msgs in self._gen:
-                self.q = q
-                self._prog = pbars[q.name]
-                for msg in msgs:
-                    self._prog.update()
-                    yield msg
+        # yield from the iterator, update/create progress bars
+        # as necessary.
+        for name, msg in self._gen:
+            # get or create a new progress bar
+            try:
+                self._prog = pbars[name]
+            except KeyError:
+                if not keys or name in keys:
+                    # dynamically create new progress bars unless filtered
+                    # by keys
+                    self._prog = pbars[name] = self._new_pbar(name, len(pbars))
+                else:
+                    continue
 
-            # close the progress bars
-            for pbar in pbars.values():
-                pbar.refresh()
-                pbar.close()
+            # update the progress, yield the message
+            # and message key
+            self._prog.update()
+            yield (name, msg) if self._kv else msg
+
+        # close the progress bars
+        for pbar in pbars.values():
+            pbar.close()
 
         self._retval = self._gen.retval
 
@@ -145,10 +176,12 @@ class progress:
         # dispatch to the current progress bar
         return getattr(self._prog, name)
 
-def compute_with_progress(b, *queues, **kwargs):
+def compute_with_progress(b, config={}, **kwargs):
     # run the computation displaying a default progress bar.
     # return the result.
-    prog = progress(b, *queues, **kwargs)
+    prog = progress(b, **kwargs)
+    for k, cfg in config.items():
+        prog.config(k, **cfg)
     for _ in prog:
         pass
     return prog.result()
