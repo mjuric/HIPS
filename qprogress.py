@@ -5,6 +5,105 @@ from functools import wraps
 from tqdm import tqdm as con_tqdm
 from tqdm.notebook import tqdm as nb_tqdm
 
+import os
+
+def listdir_dotless(*args, **kwargs):
+    return [ fn for fn in os.listdir(*args, **kwargs) if not fn.startswith('.') ]
+
+class FilesystemQueue:
+    #
+    # WARNING: THIS CLASS IS NOT THREAD SAFE (!!!)
+    #
+    def __init__(self, name=None, debug=False):
+        import uuid
+
+        if name is None:
+            name = str(uuid.uuid4())
+        self.name = name
+
+        import tempfile, getpass
+        if os.path.isdir('/dev/shm'):
+            tempdir = '/dev/shm'
+        else:
+            tempdir = tempfile.gettempdir()
+        self.dir = os.path.join(tempdir, getpass.getuser() + '-filesystemqueue-' + name)
+        try:
+            os.mkdir(self.dir, mode=0o700)
+        except FileExistsError:
+            pass
+
+        self.msgnum = 0
+        uu = str(uuid.uuid4())
+        self.prefix = os.path.join(self.dir, uu)
+        self.tmpfn = os.path.join(self.dir, '.' + uu)
+
+        # for debugging
+        self._debug = debug
+        if self._debug:
+            self._trash = os.path.join(self.dir, '.trash')
+            #print(f"Trash: {self._trash}")
+            try:
+                os.mkdir(self._trash, mode=0o700)
+                
+            except FileExistsError:
+                pass
+
+    def put(self, val):
+        import pickle
+
+        fn = f'{self.prefix}-{self.msgnum:012d}'
+        self.msgnum += 1
+
+        #print(f"{fn} <- {val}")
+        with open(self.tmpfn, 'wb') as fp:
+            pickle.dump(val, fp, -1)
+
+        assert not os.path.exists(fn)
+        os.rename(self.tmpfn, fn)
+
+    def get(self, timeout=None, batch=False):
+        import time, pickle
+
+        # wait for messages until timeout
+        dt = timeout if timeout is not None else 0.1
+        files = listdir_dotless(self.dir)
+        while True:
+            if files:
+                break
+
+            time.sleep(dt)
+            files = listdir_dotless(self.dir)
+            
+            if timeout is not None:
+                break
+
+        # if we're here and there are no files, we've timed out
+        if not files:
+            raise TimeoutError
+
+        # read accumulated messages
+        msgs = []
+        for fname in files:
+            fn = os.path.join(self.dir, fname)
+            with open(fn, "rb") as fp:
+                msg = pickle.load(fp)
+
+            if not self._debug:
+                os.unlink(fn)
+            else:
+                os.rename(fn, os.path.join(self._trash, fname))
+
+            if not batch:
+                return msg
+            msgs.append(msg)
+
+        return msgs
+
+    def qsize(self):
+        return len(listdir_dotless(self.dir))
+
+Queue=FilesystemQueue
+
 def log(*args):
     # infer message key
     if len(args) == 1:
@@ -21,6 +120,15 @@ def log(*args):
 
     # post the message
     q.put((key, args[0]))
+
+class show_progress:
+    def __init__(self, f, key="default"):
+        self.f, self.key = f, key
+
+    def __call__(self, *args, **kwargs):
+        ret = self.f(*args, **kwargs)
+        log(self.key, 1)
+        return ret
 
 class CaptureReturnValueGenerator:
     # Wraps a generator to store its return value in
@@ -70,11 +178,11 @@ def _communicate(b):
             #print("XXXXXXXXXXXX:", msgs)
             for key, msg in msgs:
                 yield key, msg
-
-            if done:
-                break
         except TimeoutError:
             pass
+
+        if done:
+            break
 
     assert q.qsize() == 0
 
