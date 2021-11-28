@@ -38,7 +38,7 @@ def _to_hips(df, hipsPath, outFn='catalog', format='csv'):
         df.to_csv(fn, mode='a', index=False, header=not os.path.exists(fn))
     elif format == 'pkl':
         # note: storing to pickle doesn't support appending
-        assert not os.path.exists(fn)
+        assert not os.path.exists(fn), f"{fn} exists and it shouldn't"
         df.to_pickle(fn)
 
     # return the number of records written
@@ -64,18 +64,18 @@ def df2hips(hipsPath, df, k, outFn='catalog.csv', format='csv'):
 import dask
 
 @dask.delayed
-def _partition_inputs(url, hipsPath, k, in_format):
+def _partition_inputs(url, hipsPath, k):
     # A function loads a file from an URL and writes out a series of
     # files into hipsPath named 'import.<url_basename>'. This guarantees
     # no other instance of _partition_worker will try to write to the same
     # file. These filles will be merged by _merge_worker() in a separate
     # pass.
-    if in_format == 'csv':
+    if url.endswith('csv') or url.endswith('csv.gz'):
         df = pd.read_csv(url)
-    elif in_format == 'parquet':
+    elif url.endswith('parquet'):
         df = pd.read_parquet(url)
     else:
-        raise Exception(f"Unknown input format '{in_format}'")
+        raise Exception(f"Unknown format of input file {url}")
 
     # write the file into 'catalog-Gaia...csv.gz' named files
     outFn = 'import.' + os.path.basename(url)
@@ -110,7 +110,7 @@ def _compactify_partitions(idx, hipsPath, outFn, format):
         os.unlink(fn)
 
 
-def csv2hips(hipsPath, urls, k=6, format='csv', in_format='csv'):
+def csv2hips(hipsPath, urls, k=6, format='csv'):
     """
     Convert a list of URLs to CSV files (may be local files) to a HiPS file
     of a given order k.
@@ -132,7 +132,7 @@ def csv2hips(hipsPath, urls, k=6, format='csv', in_format='csv'):
     #
     # Stage #1: Import files in parallel, each into its own leaf .csv file
     #
-    stage1 = c.compute([ _partition_inputs(url, hipsPath=hipsPath, k=k, in_format=in_format) for url in urls ])#, scheduler='single-threaded')
+    stage1 = c.compute([ _partition_inputs(url, hipsPath=hipsPath, k=k) for url in urls ])#, scheduler='single-threaded')
     prog = tqdm(as_completed(stage1, with_results=True), total=len(urls))
     summary = None
     for _, df in prog:
@@ -171,6 +171,6 @@ def main():
     with open('output/orders.hpix10.pkl', 'rb') as fp:
         opix, orders = pickle.load(fp)
 
-    summary = csv2hips('output', urls, k=orders, format='parquet', in_format='parquet')
+    summary = csv2hips('output', urls, k=orders, format='parquet')
     print(summary)
     print(f'Total rows imported: {summary.sum()}')

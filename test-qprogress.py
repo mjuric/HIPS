@@ -1,7 +1,7 @@
 import dask.bag as db
-from dask.distributed import Client, Queue
+from dask.distributed import Client, Queue, get_client
 import numpy as np
-from qprogress import progress, compute_with_progress, log
+from qprogress import progress, compute_with_progress, log, _redis_server, _init_backend
 
 def some_fun(v):
     log('prog1', int(v))
@@ -11,13 +11,43 @@ def some_fun2(v):
     log('prog2', int(v))
     return v
 
+def get_meta():
+    client = get_client()
+    val = client.get_metadata('redis')
+    client.set_metadata('redis', ('tuple', {'with': 'dict'}))
+    return val
+
+def test_metadata():
+    client.set_metadata('redis', "localhost:6379")
+    fut = client.submit(get_meta)
+    print(fut.result())
+    print(client.get_metadata('redis'))
+    print(client.get_metadata('doesntexist', 'nada'))
+    exit()
+
+def test_redis_launch():
+    _init_backend()
+    import time
+    print("Will sleep...")
+    time.sleep(500)
+    print("Exiting...")
+    exit(0)
+
 if __name__ == "__main__":
-    client = Client(n_workers=3, threads_per_worker=1)
+    if False:
+        test_redis_launch()
+
+    print("Starting LocalCluster... ", end='')
+    client = Client(n_workers=20, threads_per_worker=1)
+    print("done.")
 
     import test
     vals = np.arange(2000)
 
     b = db.from_sequence(vals).map(some_fun).map(lambda x: [x, 2*x]).flatten().map(some_fun2)
+
+    if False:
+        test_metadata()
 
     if True:
         prog = progress(b, kv=True).config('prog1', total=len(vals)).config('prog2', total=2*len(vals))
