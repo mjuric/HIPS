@@ -1,3 +1,56 @@
+#
+# Reliably and quickly stream progress back from Dask workers. The client-side
+# API is simple, and consists of a few functions.
+#
+# Example:
+#
+#   from hipscat.progress import compute_with_progress, show_progress, log
+#
+#    def some_fun(v):
+#        log('prog1', int(v))
+#        return v
+#
+#    def some_fun2(v):
+#        return v
+#
+#       .....
+#
+#    import dask.bag as db
+#
+#    vals = np.arange(2000)
+#    b = db.from_sequence(vals)
+#         .map(some_fun)
+#         .map(lambda x: [x, 2*x]).flatten()
+#         .map(show_progress(some_fun2))
+#
+#    result = compute_with_progress(b, config=dict(prog1=dict(desc=" First map", total=len(vals)), prog2=dict(desc="Second map", total=2*len(vals))))
+#
+#    $ python test-qprogress.py
+#    Starting LocalCluster w. nworkers=20... done.
+#    Redis started on port 6379
+#     First map: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████| 2000/2000 [00:03<00:00, 511.62it/s]
+#    Second map: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████| 4000/4000 [00:03<00:00, 1023.27it/s]
+#    $
+# 
+# API
+#
+#    compute_with_progress(futures) -- like Dask's .compute() waits for the
+#                         result of futures.compute(), showing progress
+#                         bar(s) while waiting.
+#
+#    progress(futures) -- returns a tqdm-like generator yielding progress
+#                         messages. Used when you need fine-grained control over
+#                         the progress bar. To get the result, run .result()
+#                         method on the progress object.
+# and
+#
+#    log(message) or log(key, message) -- to be used in tasks to send back a
+#                        progress message
+#
+#    show_progress(func) -- used to wrap the function func to send a
+#                           progress message each time it runs.
+#
+
 from dask.distributed import Queue, TimeoutError, get_client, Lock, Variable
 from dask.distributed.utils import is_kernel
 from functools import wraps

@@ -1,15 +1,14 @@
 import dask.bag as db
 from dask.distributed import Client, Queue, get_client
 import numpy as np
-import qprogress
-from qprogress import progress, compute_with_progress, log
+import hipscat.progress as qprogress
+from hipscat.progress import progress, compute_with_progress, show_progress, log
 
 def some_fun(v):
     log('prog1', int(v))
     return v
 
 def some_fun2(v):
-    log('prog2', int(v))
     return v
 
 def get_meta():
@@ -46,12 +45,12 @@ if __name__ == "__main__":
     import test
     vals = np.arange(2000)
 
-    b = db.from_sequence(vals).map(some_fun).map(lambda x: [x, 2*x]).flatten().map(some_fun2)
+    b = db.from_sequence(vals).map(some_fun).map(lambda x: [x, 2*x]).flatten().map(show_progress(some_fun2, key='prog2'))
 
     if False:
         test_metadata()
 
-    if True:
+    if False:
         prog = progress(b, kv=True).config('prog1', total=len(vals)).config('prog2', total=2*len(vals))
         totals = dict(prog1=0, prog2=0)
         for k, v in prog:
@@ -59,7 +58,7 @@ if __name__ == "__main__":
             prog.set_postfix_str(f'Rows loaded: {totals[k]: 12,d}')
         result = prog.result()
 
-    if False:
+    if True:
 #        result = compute_with_progress(b, desc_prog1=" First map", desc_prog2="Second map", total_prog1=len(vals), total_prog2=2*len(vals))
         result = compute_with_progress(b, config=dict(prog1=dict(desc=" First map", total=len(vals)), prog2=dict(desc="Second map", total=2*len(vals))))
 
