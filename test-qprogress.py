@@ -38,8 +38,9 @@ if __name__ == "__main__":
     if False:
         test_redis_launch()
 
-    print("Starting LocalCluster... ", end='')
-    client = Client(n_workers=20, threads_per_worker=1)
+    nworkers=20
+    print(f"Starting LocalCluster w. nworkers={nworkers}... ", end='')
+    client = Client(n_workers=nworkers, threads_per_worker=1)
     print("done.")
 
     import test

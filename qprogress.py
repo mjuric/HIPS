@@ -311,27 +311,32 @@ class RedisServer:
         return self
 
 _initialized = False
-def init(client=None):
+def init(client=None, _class=Queue):
     global _initialized
     if _initialized:
         return
     
-    if Queue == RedisQueue:
+    if _class == RedisQueue:
         # if Redis isn't already running somewhere, autmatically start it
         # and store the connection info in cluster metadata
-        if client is not None and client.get_metadata('redis', None) is not None:
-            # Already running somewhere and registered with Dask
-            _initialized = True
-            return
+        if client is not None:
+            cfg = client.get_metadata('redis', None)
+            if cfg is not None:
+                # Already running somewhere and registered with Dask
+                _initialized = True
+                return cfg
 
         # start redis
         _redis_server = RedisServer().start()
+        cfg = dict(password=_redis_server.pwd, port=_redis_server.port)
         print(f"Redis started on port {_redis_server.port}")
 
         # store connection info with Dask
         if client is not None:
-            client.set_metadata('redis', dict(password=_redis_server.pwd, port=_redis_server.port))
+            client.set_metadata('redis', cfg)
         _initialized = True
+        
+        return cfg
     else:
         # assume no special initialization needed for other Queue types
         _initialized = True
