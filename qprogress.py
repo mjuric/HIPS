@@ -13,7 +13,7 @@ def listdir_dotless(*args, **kwargs):
 
 def get_uuid():
     #
-    # Return an UUID unique to this scheduler
+    # Return a string unique to this scheduler
     #
     client = get_client()
 
@@ -23,16 +23,6 @@ def get_uuid():
 
     client._qprogress_uu = client.scheduler_info()['id']
     return client._qprogress_uu
-
-#    # generate a cluster-wide UUID (and cache locally)
-#    with Lock('qprogress-uuid-lock'):
-#        uu = client.get_metadata('qprogress.uuid', None)
-#        if uu is None:
-#            import uuid
-#            uu = str(uuid.uuid4())
-#            client.set_metadata('qprogress.uuid', uu)
-#        client._qprogress_uu = uu
-#        return uu
 
 import redis
 class RedisQueue:
@@ -45,7 +35,9 @@ class RedisQueue:
 
         # if redis connection info hasn't been given, find one from the cluster
         if _redis is None:
-            _redis = get_client().get_metadata('qprogress.redis', {})
+            _redis = get_client().get_metadata('redis', None)
+            if _redis is None:
+                raise Exception("Must have Redis running. Did you call qprogress.init(client) when you started the Dask cluster?")
 
         self.__db = redis.Redis(**_redis)
 
@@ -258,57 +250,91 @@ def set_pdeathsig(sig = signal.SIGTERM):
         return libc.prctl(1, sig)
     return callable
 
-def _redis_server(pwd):
-    # launch redis-server
-    import subprocess
-    ls_output=subprocess.Popen(["redis-server", "-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, preexec_fn=set_pdeathsig(signal.SIGINT))
-    cfg = f"requirepass '{pwd}'\ndaemonize no".encode('utf-8')
-#    print("===================")
-#    print(cfg)
-#    print("===================")
-    ret = ls_output.communicate(cfg)
-
-_backend_initialized = False
-def _init_backend(client=None):
-    global _backend_initialized
-    if _backend_initialized:
-        return
-
-    if Queue == RedisQueue:
-        # autmatically start redis and store the connection info in
-        # the cluster metadata
+class RedisServer:
+    def __init__(self, pwd=None, port_range=(6379, 6979)):
+        self.started = False
+        self.port_range = port_range
+        self.port = port_range[0]
         
-        # 1. generate redis password
-        import secrets
-        password_length = 16
-        redispwd = secrets.token_urlsafe(password_length)
-        print(f"redis password: {redispwd}")
+        if pwd is None:
+            import secrets
+            pwd = secrets.token_urlsafe(16)
 
-        # 2. launch redis & wait until up
-        import threading
-        threading.Thread(target=_redis_server, args=(redispwd,), daemon=True).start()
+        self.pwd = pwd
 
-        r = redis.Redis(password=redispwd)
-        for _ in range(50):
+    def _thread(self):
+        # launch redis-server, finding an open port if needed
+        import subprocess
+
+        for port in range(*self.port_range):
+#            print(f"Trying to start Redis on {port}...")
+            self.port = port
+
+            p=subprocess.Popen(["redis-server", "-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, preexec_fn=set_pdeathsig(signal.SIGINT))
+#            p=subprocess.Popen(["redis-server", "-"], stdin=subprocess.PIPE, preexec_fn=set_pdeathsig(signal.SIGINT))
+            cfg = f"""
+                requirepass '{self.pwd}'
+                port {port}
+            """.encode('utf-8')
+            ret = p.communicate(cfg)
+
+#            print(f"--------- Failed ret={ret}")
+            with self._lock:
+                if self.started:
+                    break
+
+    def start(self, timeout=10):
+        import threading, time
+
+        self._started = False
+        self._lock = threading.Lock()
+
+        threading.Thread(target=self._thread, daemon=True).start()
+
+        # wait until the server responds to pings
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            r = redis.Redis(password=self.pwd, port=self.port)
             try:
-                print("-------------XXXXXXXXXXXXX Ping")
-                r.ping()
-                print("-------------XXXXXXXXXXXXX OK")
+#                print("-------------XXXXXXXXXXXXX Ping")
+                with self._lock: # needed to avoid the race where r.ping() succeeds, and the server crashes & restarts before self.started=True runs
+                    r.ping()
+#                    print(f"-------------XXXXXXXXXXXXX Success. port={self.port}")
+                    self.started = True
                 break
-            except redis.ConnectionError:
-                print("+++++++++++++ connection error")
-                import time
-                time.sleep(0.1)
+            except redis.ConnectionError as e:
+#                print(f"+++++++++++++ connection error {e}")
+                time.sleep(0.01)
         else:
             raise Exception("Couldn't connect to redis")
-        print("XXXXXXXXXXXXXXXXX")
 
-        # 3. store password as dask cluster metadata
+        return self
+
+_initialized = False
+def init(client=None):
+    global _initialized
+    if _initialized:
+        return
+    
+    if Queue == RedisQueue:
+        # if Redis isn't already running somewhere, autmatically start it
+        # and store the connection info in cluster metadata
+        if client is not None and client.get_metadata('redis', None) is not None:
+            # Already running somewhere and registered with Dask
+            _initialized = True
+            return
+
+        # start redis
+        _redis_server = RedisServer().start()
+        print(f"Redis started on port {_redis_server.port}")
+
+        # store connection info with Dask
         if client is not None:
-            client.set_metadata('qprogress.redis', dict(password=redispwd))
-
-        # 4. flip our "initialized" flag
-        _backend_initialized = True
+            client.set_metadata('redis', dict(password=_redis_server.pwd, port=_redis_server.port))
+        _initialized = True
+    else:
+        # assume no special initialization needed for other Queue types
+        _initialized = True
 
 def log(*args):
     # infer message key
@@ -368,7 +394,7 @@ def _communicate(b):
     # received, and a batch of received messages.
 
     client = get_client()
-    _init_backend(client)
+    init(client)
 
     fut = client.compute(b)
 
@@ -418,6 +444,9 @@ class progress:
         # (example: length=10 would be passed to all progress bars, but length2=10 only to
         # progress bar #2). The counting starts at 1.
         #
+        client = get_client()
+        init(client)
+
         self._gen = _communicate(b)
         self._retval = None
         self._kv = kv

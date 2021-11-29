@@ -1,7 +1,8 @@
 import dask.bag as db
 from dask.distributed import Client, Queue, get_client
 import numpy as np
-from qprogress import progress, compute_with_progress, log, _redis_server, _init_backend
+import qprogress
+from qprogress import progress, compute_with_progress, log
 
 def some_fun(v):
     log('prog1', int(v))
@@ -26,7 +27,7 @@ def test_metadata():
     exit()
 
 def test_redis_launch():
-    _init_backend()
+    qprogress.init()
     import time
     print("Will sleep...")
     time.sleep(500)
