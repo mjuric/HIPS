@@ -1,0 +1,277 @@
+#!/usr/bin/env python
+
+#
+# hc import hips gaia/*.csv.gz
+#
+# hc import <output> <inputs [...]>
+#
+# Options:
+#   -k --counts-order=10
+#   -t --partition-size-threshold=1,000,000
+#   --lon=ra
+#   --lat=dec
+#
+# Algorithm:
+#  * Compute the counts map, store the parquet files into <output>/import/cache
+#  * Compute the partitioning map
+#  * Repartition the parquet files, storing pieces into <output>/import/partitions
+#  * Merge the parquet files, storing outputs into hips/
+#
+# Desirables:
+#  * must be able to continue importing if interrupted at any point
+#
+
+import numpy as np
+import pandas as pd
+import healpy as hp
+import dask.bag as db
+import os
+from functools import partial
+from hipscat.partmap import HipsPartitioning
+import hipscat
+from tqdm import tqdm
+
+from qprogress import compute_with_progress, show_progress
+
+def _hpix_hist(dfs, k, lon, lat):
+    # histogram the list of parts, and return it
+    img = np.zeros(hp.order2npix(k), dtype=np.uint32)
+    for df in dfs:
+        # compute our part of the counts map
+        hpix = hp.ang2pix(2**k, df[lon].values, df[lat].values, lonlat=True, nest=True)
+        hpix, ct = np.unique(hpix, return_counts=True)
+        img[hpix] += ct.astype(np.uint32)
+
+    return img
+
+def _load_file(fn, columns=None):
+    # loads an input file, based on extension
+    lfn = fn.lower()
+
+    # CSV
+    if lfn.endswith( ('.csv', '.csv.gz', '.csv.bz2') ):
+        return pd.read_csv(fn, usecols=columns)
+
+    # Parquet
+    if lfn.endswith('.parquet'):
+        return pd.read_parquet(fn, columns=columns)
+        
+    raise Exception(f"Unknown file format for {fn}")
+
+def gather_statistics(inputs, k, lon, lat):
+    # files: iterable of files to load
+    # cache_dir: output director where to drop file copies (with .parquet extension)
+    # k: healpix order of the counts map
+    #
+    # returns: img (k-order healpix map with object counts)
+#    show_progress = lambda x: x
+    img = (
+        db.from_sequence(inputs)
+            .map(show_progress(_load_file), columns=[lat, lon])
+            .reduction(partial(_hpix_hist, k=k, lon=lon, lat=lat), sum, split_every=4)
+        )
+
+#    return img.compute()
+    return compute_with_progress(img, total=len(inputs))
+
+import contextlib
+
+@contextlib.contextmanager
+def dask_tqdm(objs, *args, **kwargs):
+    if not isinstance(objs, list):
+        objs = [ objs ]
+
+    from dask.distributed import as_completed, get_client
+    client = get_client()
+
+    fut = client.compute(objs)
+
+    kwargs['total'] = len(objs)
+    
+    yield tqdm(as_completed(fut, with_results=True), *args, **kwargs)
+
+class Importer:
+    def __init__(self, impath, dbpath, lon, lat, k, threshold):
+        # create a new catalog importer
+        self.impath = impath
+        self.dbpath = dbpath
+        self.parquets = os.path.join(self.impath, 'parquet')
+
+        self.lon = lon
+        self.lat = lat
+        self.k = k
+        self.threshold = threshold
+
+        self.files = set()
+        self.partitioning = None
+
+        os.makedirs(self.dbpath)
+        os.makedirs(self.impath)
+        os.makedirs(self.parquets)
+
+        self.checkpoint()
+
+    def checkpoint(self):
+        fn = os.path.join(self.impath, 'meta.pkl')
+
+        import pickle
+        with open(fn, 'wb') as fp:
+            pickle.dump(self, fp, -1)
+
+    def _cached_parquet_fn(self, fn):
+        return os.path.join(self.parquets, os.path.basename(fn).split('.')[0] + '.parquet')
+
+    def run(self, inputs):
+        # gather statistics to compute the partitioning
+        print(f'Gathering statistics for {len(inputs)} files')
+        img = gather_statistics(inputs, self.k, self.lon, self.lat)
+        self.partitioning = HipsPartitioning(img)
+        self.files = set(inputs)
+
+        # import
+        #self.do_import(parquets)
+
+        # save metadata
+        self.checkpoint()
+
+    def do_import(self, urls):
+        from dask.distributed import get_client
+        client = get_client()
+
+        # upload the partition map to the workers
+        k = client.scatter(self.partitioning.orders, broadcast=True)
+
+        #
+        # Stage #1: Import files in parallel, each into its own temporary leaf file
+        #
+        summary = None
+        with dask_tqdm([ hipscat._partition_inputs(url, hipsPath=self.dbpath, k=k) for url in urls ]) as prog:
+            for _, df in prog:
+                # FIXME: this changes the datatype to float... grrr...
+                summary = summary.add(df, fill_value=0).astype(int) if summary is not None else df
+
+                # give us the number of rows imported
+                prog.set_postfix({'rows imported': str(f'{summary.sum():,d}')})
+
+        #
+        # Stage #2: Merge the individual leaf files into a single file per partition
+        #
+        with dask_tqdm([ hipscat._compactify_partitions(idx, hipsPath=self.dbpath, outFn='catalog', format='parquet') for idx in summary.index ]) as prog:
+            for _, df in prog:
+                pass
+
+        return summary
+
+    @classmethod
+    def restore(cls, impath):
+        fn = os.path.join(impath, 'meta.pkl')
+
+        import pickle
+        with open(fn, 'rb') as fp:
+            return pickle.load(fp)
+
+
+def _convert_to_parquet(inout):
+    infn, outfn = inout
+
+    exists = os.path.exists(outfn)
+    if not exists:
+        # load input
+        df = pd.read_csv(infn)
+
+        # failiure-safe writing of the output file
+        import uuid
+        tmpfn = os.path.join(os.path.dirname(outfn), "." + str(uuid.uuid4()) + ".parquet")
+        df.to_parquet(tmpfn)
+        os.rename(tmpfn, outfn)
+        
+    return (outfn, exists)
+
+def cmd_convert(args):
+    #
+    # Convert a batch of files from one format to another
+    #
+    os.makedirs(args.output, exist_ok=True)
+
+    # create a list of (input_fn, output_fn) pairs
+    filenames = [ os.path.basename(fn).split('.')[0] + '.parquet' for fn in args.inputs ]
+    assert len(set(filenames)) == len(filenames)
+
+    outputs = [ os.path.join(args.output, fn) for fn in filenames ]
+    inout = list(zip(args.inputs, outputs))
+
+    init_dask(args)
+
+    b = db.from_sequence(inout, partition_size=1).map(show_progress(_convert_to_parquet))
+    results = compute_with_progress(b, total=len(inout))
+
+    _, exists = list(zip(*results))
+    ntotal = len(exists)
+    nexists = sum(exists)
+    print(f"Converted {ntotal - nexists} files, skipped {nexists} existing files (total {ntotal}).")
+
+def cmd_import(args):
+    #
+    # Import a catalog
+    #
+
+    # create the output directory
+    impath = os.path.join(args.output, '_import')
+
+    if os.path.isdir(args.output):
+        dbi = Importer.restore(impath)
+    else:
+        dbi = Importer(impath, args.output, args.lon, args.lat, args.k, args.threshold)
+
+    init_dask(args)
+    dbi.run(args.inputs)
+
+def init_dask(args):
+    import dask
+    from dask.distributed import Client
+    dask.config.set({"distributed.comm.timeouts.connect": 200})
+
+    print(f'Starting local Dask cluster ({args.ncores} workers) ... ', end='')
+    c = Client(n_workers=args.ncores, threads_per_worker=1)
+    print('done.')
+    return c
+
+def available_cores():
+    #
+    # Return an apropriate default number of cores to use.
+    #
+    import os, psutil
+    ncores = len(os.sched_getaffinity(0))		# the number of cores available to this process
+    ncores_phys = psutil.cpu_count(logical=False)	# number of physical cores present
+    ncores_logi = psutil.cpu_count(logical=True)	# number of physical cores present
+
+    # if ncores == ncores_logi, assume this is just the default in which case
+    # we want to play it safe and return the number of physical cores available
+    return ncores_phys if ncores == ncores_logi else ncores_logi
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description='HiPS Catalog Utility', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-j', '--cores', metavar='N', dest='ncores', default=available_cores(), type=int, help='Number of cores to use')
+    subparsers = parser.add_subparsers(help='Available subcommands')
+
+    import_cmd = subparsers.add_parser('convert', help='convert a batch of files between formats')
+    import_cmd.set_defaults(func=cmd_convert)
+    import_cmd.add_argument('output', type=str, help='output directory for the converted files')
+    import_cmd.add_argument('inputs', metavar='input', type=str, nargs='+', help='input files')
+
+    import_cmd = subparsers.add_parser('import', help='import a HiPS catalog')
+    import_cmd.set_defaults(func=cmd_import)
+    import_cmd.add_argument('output', type=str, help='output HiPS catalog directory')
+    import_cmd.add_argument('inputs', metavar='input', type=str, nargs='+', help='input files')
+    import_cmd.add_argument('-k', '--counts-map-order', metavar='K', dest='k', default=10, type=int, help='Healpix order of the counts map')
+    import_cmd.add_argument('-t', '--partition-size-threshold', metavar='N', dest='threshold', default=10, type=int, help='Maximum number of records in a partition before it\'s split.')
+    import_cmd.add_argument('--lon', default='ra', type=str, help='Longitude column in the input files')
+    import_cmd.add_argument('--lat', default='dec', type=str, help='Latitude column in the input files')
+
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
