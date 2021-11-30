@@ -65,8 +65,13 @@ def listdir_dotless(*args, **kwargs):
     return [ fn for fn in os.listdir(*args, **kwargs) if not fn.startswith('.') ]
 
 def get_uuid():
+    # Return a string unique to this scheduler. Useful when creating entries
+    # in shared resources (e.g.  Redis, or /tmp ) that are meant to be
+    # unique to us.
     #
-    # Return a string unique to this scheduler
+    # Performance: meant to be fast (after the first lookup).
+    # FIXME: if the scheduler changes (e.g., it's restarted), this function 
+    # won't notice.
     #
     client = get_client()
 
@@ -76,6 +81,13 @@ def get_uuid():
 
     client._qprogress_uu = client.scheduler_info()['id']
     return client._qprogress_uu
+
+#
+# A simple Queue (with Dask.Queue API) built on top of Redis)
+#
+# Why: because dask.Queue implementation is very slow. It tends to dominate
+# the runtime once there are more than a ~few messages per second.
+#
 
 import redis
 class RedisQueue:
@@ -246,7 +258,7 @@ class FilesystemQueue:
         with open(self.tmpfn, 'wb') as fp:
             pickle.dump(val, fp, -1)
 
-        assert not os.path.exists(fn)
+        assert not os.path.exists(fn), fn
         os.rename(self.tmpfn, fn)
 
     def get(self, timeout=None, batch=False):

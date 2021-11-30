@@ -31,7 +31,7 @@ from hipscat.partmap import HipsPartitioning
 import hipscat
 from tqdm import tqdm
 
-from qprogress import compute_with_progress, show_progress
+from hipscat.progress import compute_with_progress, show_progress
 
 def _hpix_hist(dfs, k, lon, lat):
     # histogram the list of parts, and return it
