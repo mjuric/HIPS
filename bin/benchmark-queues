@@ -1,0 +1,157 @@
+#!/usr/bin/env python
+
+import hipscat.progress as qprogress
+import time
+from asyncio.exceptions import TimeoutError
+from dask.distributed import Client, Queue, get_client, wait, Event
+import dask
+import numpy as np
+
+import uuid
+uid = str(uuid.uuid4())
+
+def produce(q, nmsg=1_000):
+    for i in range(nmsg):
+        msg = f'{uid}::message {i}'
+        q.put(msg)
+
+def consume(q):
+    try:
+        return q.get(timeout=0, batch=True)
+    except TimeoutError:
+        return []
+
+@dask.delayed
+def timed_produce(Queue, name, nmsg=1_000):
+    q = Queue(name)
+
+    # wait until the consumer is ready
+    e = Event('start')
+    e.wait()
+
+    t0 = time.perf_counter()
+    produce(q, nmsg=nmsg)
+    t1 = time.perf_counter()
+    dt = (t1 - t0) * 1000 # milliseconds
+    return dt
+
+def timed_consume(futures, q, verbose):
+    prefix = f'{uid}::message '
+    prod_dt = []
+    nmsg = 0
+
+    running = futures
+    tm = 0.1
+
+    t0 = time.perf_counter()
+    while len(running):
+        # check if we have remaining running futures
+        try:
+            # Sigh....
+            # dask bug #1: setting timeout=0 causes "RuntimeWarning: coroutine 'FutureState.wait' was never awaited" (and the loop never exits)
+            # dask bug #2: setting timeout=0.000001 causes wait to timeout always
+            # Schlamperei !!:
+            _, running = wait(running, timeout=0.001, return_when='FIRST_COMPLETED')
+        except TimeoutError:
+            pass
+        if len(running) == 0:
+            tm = 0.
+
+        # consume from the queue
+        try:
+            if verbose: print(f"Get {len(running)=} {tm=} ... ", end='')
+            msgs = q.get(timeout=tm, batch=True)
+            nmsg += len(msgs)
+            if verbose: print(f"done {len(msgs)=} {nmsg=}")
+        except TimeoutError:
+            if verbose:
+                print(f"timed out.")
+                for i, fut in enumerate(running):
+                    print(f"   {i=} {fut=}")
+            continue
+
+        for msg in msgs:
+            assert msg.startswith(prefix), f"{msg=} {prefix=}"
+
+    t1 = time.perf_counter()
+
+    # collect results
+    prod_dt += [ fut.result() for fut in futures ]
+
+    dt = (t1 - t0) * 1000 # milliseconds
+    return dt, prod_dt, nmsg
+
+def available_cores():
+    #
+    # Return an apropriate default number of cores to use.
+    #
+    import os, psutil
+    ncores = len(os.sched_getaffinity(0))		# the number of cores available to this process
+    ncores_phys = psutil.cpu_count(logical=False)	# number of physical cores present
+    ncores_logi = psutil.cpu_count(logical=True)	# number of physical cores present
+
+    # if ncores == ncores_logi, assume this is just the default in which case
+    # we want to play it safe and return the number of physical cores available
+    return ncores_phys if ncores == ncores_logi else ncores_logi
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Benchmark Dask Queue implementations by spinning up workers '
+             + 'and measuring how many messages can be sent/received between the workers '
+             + 'and the main program', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('queue_class', choices=['Queue', 'FilesystemQueue', 'RedisQueue'], help='Queue class to benchmark.')
+    parser.add_argument('-j', '--workers', default=available_cores(), type=int, help='Number of workers to use.')
+    parser.add_argument('-m', '--messages', default=10_000, type=int, help='(Approximate) number of messages to send.')
+    parser.add_argument('-v', '--verbose', default=False, action='store_true', help='Verbose output')
+    args = parser.parse_args()
+
+    nworkers = args.workers
+    nmsg=args.messages
+    qclass = args.queue_class
+    verbose = args.verbose
+
+    #
+    # Start Dask
+    #
+    client = Client(n_workers=nworkers, threads_per_worker=1)
+    print(f"Started {nworkers=} cluster")
+
+    if qclass == 'FilesystemQueue':
+        q = qprogress.FilesystemQueue("default")
+    elif qclass == 'RedisQueue':
+        qprogress.init(client=client, _class=qprogress.RedisQueue)
+        q = qprogress.RedisQueue("default")
+    elif qclass == 'Queue':
+        q = Queue("default")
+    else:
+        assert False, "Bug. This shouldn't happen."
+
+    print(f"Benchmarking {q.__class__}")
+
+     # event to synchronise start of producing with start of consuming
+    e = Event('start')
+
+    # submit all workers
+    nperworker = nmsg // nworkers
+    nmsg = nperworker * nworkers
+    print(f"Launching tasks ...", end='')
+    futures = client.compute( [ timed_produce(q.__class__, q.name, nperworker) for _ in range(nworkers) ] )
+    print(f"done.")
+
+    # Give the workers a second to get to being blocked on event e (FIXME: there should be less hacky way to do this)
+    time.sleep(1)
+
+    # ... and then start consuming
+    print(f"Starting to consume.")
+    e.set() # notify the workers we're ready to go
+    dt, prod_dt, nmsg_received = timed_consume(futures, q, verbose)
+    assert nmsg_received == nmsg, f"{nmsg_received=} {nmsg=}"
+    med_dt = np.median(prod_dt)
+
+    print(f"Consume ran for {dt} milliseconds, Received {1000/(dt/nmsg):,.0f} msgs/sec.")
+    print(f"Median produce ran for {med_dt} milliseconds for {nperworker} messages, {1000/(med_dt/nperworker):,.0f} msgs/sec/worker.")
+    if verbose:
+        print("Per-task timings:")
+        for i, dt in enumerate(prod_dt):
+            print(f"  {i=} {dt=}")

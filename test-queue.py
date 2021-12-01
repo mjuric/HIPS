@@ -113,14 +113,14 @@ def test(q):
 
 if __name__ == "__main__":
 
-    nworkers = 20
+    nworkers = 48
     client = Client(n_workers=nworkers, threads_per_worker=1)
     print(f"Started {nworkers=} cluster")
 
-    q = qprogress.FilesystemQueue("default")
+#    q = qprogress.FilesystemQueue("default")
 
-#    qprogress.init(client=client, _class=qprogress.RedisQueue)
-#    q = qprogress.RedisQueue("default")
+    qprogress.init(client=client, _class=qprogress.RedisQueue)
+    q = qprogress.RedisQueue("default")
 
 #    q = Queue("default")
 
@@ -130,7 +130,7 @@ if __name__ == "__main__":
         test(q)
 
     if True:
-        nmsg=4_000
+        nmsg=40_000
         e = Event('start') # to synchronise start of producing with start of consuming
 
         # submit all workers
