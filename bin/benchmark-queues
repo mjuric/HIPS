@@ -86,9 +86,14 @@ def available_cores():
     # Return an apropriate default number of cores to use.
     #
     import os, psutil
-    ncores = len(os.sched_getaffinity(0))		# the number of cores available to this process
     ncores_phys = psutil.cpu_count(logical=False)	# number of physical cores present
     ncores_logi = psutil.cpu_count(logical=True)	# number of physical cores present
+
+    from sys import platform
+    if platform == "darwin":
+        ncores = ncores_logi
+    else:
+        ncores = len(os.sched_getaffinity(0))		# the number of cores available to this process
 
     # if ncores == ncores_logi, assume this is just the default in which case
     # we want to play it safe and return the number of physical cores available

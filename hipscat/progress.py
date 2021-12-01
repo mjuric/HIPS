@@ -305,15 +305,20 @@ class FilesystemQueue:
 #Queue = FilesystemQueue
 Queue = RedisQueue
 
-# See https://stackoverflow.com/questions/19447603/how-to-kill-a-python-child-process-created-with-subprocess-check-output-when-t
-# for how this ensures redis is cleanly cleaned up when we terminate
+from sys import platform
 import signal
-import ctypes
-libc = ctypes.CDLL("libc.so.6")
-def set_pdeathsig(sig = signal.SIGTERM):
-    def callable():
-        return libc.prctl(1, sig)
-    return callable
+if platform.startswith("linux"):
+    # See https://stackoverflow.com/questions/19447603/how-to-kill-a-python-child-process-created-with-subprocess-check-output-when-t
+    # for how this ensures redis is cleanly cleaned up when we terminate
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6")
+    def set_pdeathsig(sig = signal.SIGTERM):
+        def callable():
+            return libc.prctl(1, sig)
+        return callable
+else:
+    def set_pdeathsig(sig = signal.SIGTERM):
+        pass
 
 class RedisServer:
     def __init__(self, pwd=None, port_range=(6379, 6979)):
