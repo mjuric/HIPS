@@ -305,81 +305,6 @@ class FilesystemQueue:
 #Queue = FilesystemQueue
 Queue = RedisQueue
 
-from sys import platform
-import signal
-if platform.startswith("linux"):
-    # See https://stackoverflow.com/questions/19447603/how-to-kill-a-python-child-process-created-with-subprocess-check-output-when-t
-    # for how this ensures redis is cleanly cleaned up when we terminate
-    import ctypes
-    libc = ctypes.CDLL("libc.so.6")
-    def set_pdeathsig(sig = signal.SIGTERM):
-        def callable():
-            return libc.prctl(1, sig)
-        return callable
-else:
-    def set_pdeathsig(sig = signal.SIGTERM):
-        pass
-
-class RedisServer:
-    def __init__(self, pwd=None, port_range=(6379, 6979)):
-        self.started = False
-        self.port_range = port_range
-        self.port = port_range[0]
-        
-        if pwd is None:
-            import secrets
-            pwd = secrets.token_urlsafe(16)
-
-        self.pwd = pwd
-
-    def _thread(self):
-        # launch redis-server, finding an open port if needed
-        import subprocess
-
-        for port in range(*self.port_range):
-#            print(f"Trying to start Redis on {port}...")
-            self.port = port
-
-            p=subprocess.Popen(["redis-server", "-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, preexec_fn=set_pdeathsig(signal.SIGINT))
-#            p=subprocess.Popen(["redis-server", "-"], stdin=subprocess.PIPE, preexec_fn=set_pdeathsig(signal.SIGINT))
-            cfg = f"""
-                requirepass '{self.pwd}'
-                port {port}
-            """.encode('utf-8')
-            ret = p.communicate(cfg)
-
-#            print(f"--------- Failed ret={ret}")
-            with self._lock:
-                if self.started:
-                    break
-
-    def start(self, timeout=10):
-        import threading, time
-
-        self._started = False
-        self._lock = threading.Lock()
-
-        threading.Thread(target=self._thread, daemon=True).start()
-
-        # wait until the server responds to pings
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            r = redis.Redis(password=self.pwd, port=self.port)
-            try:
-#                print("-------------XXXXXXXXXXXXX Ping")
-                with self._lock: # needed to avoid the race where r.ping() succeeds, and the server crashes & restarts before self.started=True runs
-                    r.ping()
-#                    print(f"-------------XXXXXXXXXXXXX Success. port={self.port}")
-                    self.started = True
-                break
-            except redis.ConnectionError as e:
-#                print(f"+++++++++++++ connection error {e}")
-                time.sleep(0.01)
-        else:
-            raise Exception("Couldn't connect to redis")
-
-        return self
-
 _initialized = False
 def init(client=None, _class=Queue):
     global _initialized
@@ -397,6 +322,7 @@ def init(client=None, _class=Queue):
                 return cfg
 
         # start redis
+        from .redis import RedisServer
         _redis_server = RedisServer().start()
         cfg = dict(password=_redis_server.pwd, port=_redis_server.port)
         print(f"Redis started on port {_redis_server.port}")
