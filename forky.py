@@ -202,16 +202,10 @@ def _server(preload, payload, timeout=None):
                 # Child process
                 debug(f"Forked child at {os.getpid()=}")
                 sock.close()
-                # read the command line (see client for protocol description)
                 fd = conn.fileno()
-                hdr = array.array('i')
-                hdr.frombytes(_read_n(fd, 4))
-                msglen = hdr[0]
-                debug(f"Message length is {msglen=}")
-                msg = _read_n(fd, msglen).decode('utf-8')
-                debug(f"Raw message is {msg=}")
-                # parse & reset our sys.argv
-                sys.argv = msg.split('\0')
+
+                # get command line
+                sys.argv = _read_object(fd)
                 debug(f"{sys.argv=}")
 
                 # Next are the pipes to communicate with the master
@@ -228,7 +222,7 @@ def _server(preload, payload, timeout=None):
 
                 # Next is the window size info and tty attributes
                 debug(f"Receiving window size and tty attributes:")
-                mode, winsz = pickle.loads(_read_msg(fd))
+                mode, winsz = _read_object(fd)
                 debug(f"{winsz=}")
 
                 # Now we fork the process attached to a new pty
@@ -251,12 +245,18 @@ def _read_n(fd, length):
         b += os.read(fd, len(b)-length)
     return b
 
+def _read_object(fd):
+    return pickle.loads(_read_msg(fd))
+
 def _read_msg(fd):
     msglen, = struct.unpack('I', _read_n(fd, 4))
 #    debug(f"Message length is {msglen=}")
     msg = _read_n(fd, msglen)
 #    debug(f"Raw message is {msg=}")
     return msg
+
+def _send_object(fd, obj):
+    return _send_msg(fd, pickle.dumps(obj, -1))
 
 def _send_msg(fd, data):
     # msg format: [length][payload]
@@ -306,13 +306,10 @@ def _connect(preload, payload, timeout=None):
     # try connecting
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(socket_path)
+    fd = client.fileno()
 
     # send our command line
-    args = '\0'.join(sys.argv)
-    a = array.array('i')
-    a.append(len(args))
-    client.sendall(a.tobytes()) # header with the command line length
-    client.sendall(args.encode('utf-8')) # the command line
+    _send_object(fd, sys.argv)
 
     # now create and send the pipes over which we'll communicate
     # stdin, stdout, stderr
@@ -325,7 +322,8 @@ def _connect(preload, payload, timeout=None):
     # Next is the local tty attributes and window size
     winsz = _getwinsize(STDOUT)
     mode = termios.tcgetattr(STDIN)
-    _send_msg(client.fileno(), pickle.dumps((mode, winsz)))
+    _send_object(fd, (mode, winsz))
+#    _send_msg(client.fileno(), pickle.dumps((mode, winsz)))
 
     # switch input to raw mode
     # See here for _very_ useful info:
