@@ -1,11 +1,11 @@
-import socket, os, sys, array, struct, pickle, tty, fcntl, termios
+import socket, os, sys, array, struct, pickle, tty, fcntl, termios, select
 
 # https://gist.github.com/jmhobbs/11276249
 socket_path = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'echo.socket')
 
-STDIN=0
-STDOUT=1
-STDERR=2
+STDIN  = STDIN_FILENO  = 0
+STDOUT = STDOUT_FILENO = 1
+STDERR = STDERR_FILENO = 2
 
 # From http://computer-programming-forum.com/56-python/ef56832eb6f33ba3.htm
 # h, w = struct.unpack("hhhh", fcntl.ioctl(0, termios.TIOCGWINSZ ,"\000"*8))[0:2]
@@ -76,6 +76,7 @@ def openpty(mode=None, winsz=None):
     if winsz:
         _setwinsize(slave_fd, winsz)
 
+    print(f"{os.ttyname(slave_fd)=}")
     return master_fd, slave_fd
 
 def _login_tty(fd):
@@ -111,6 +112,7 @@ def _login_tty(fd):
 
 def _run_payload(payload):
     print("Welcome to my echo chamber!")
+
     import time, tqdm
     for _ in tqdm.tqdm(range(100), file=sys.stdout):
         time.sleep(0.1)
@@ -129,13 +131,34 @@ def _run_payload(payload):
 
     exit(0)
 
-def _spawn(payload, conn, mode, winsz):
+# TODO: understand why this is needed...?
+import signal
+#def _handle_tstp(signum, frame):
+#    debug(f"WORKER: Received {signum=}")
+#    os.kill(os.getpid(), signal.SIGSTOP)
+
+def _setup_tstp(remote_pid):
+    def _handle_tstp(signum, frame):
+        debug(f"_handle_tstp: Received {signum=} [{remote_pid=}]")
+        os.kill(os.getpgid(remote_pid), signal.SIGTSTP)
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    signal.signal(signal.SIGTSTP, _handle_tstp)
+
+#def _handle_chld(signum, frame):
+#    debug(f"CHLD Received {signum=}")
+
+def _spawn(payload, remote_pid, conn, mode, winsz):
     #
     # Spawn a process to execute the Python code. The parent will
     # stay behind to receive and pass on SIGWINCH and other signals.
     #
     master_fd, slave_fd = openpty(mode, winsz)
     debug(f"Opened PTY {master_fd=} {slave_fd=}")
+
+    # send back the master_fd
+    socket.send_fds(conn, [ b'm' ], [master_fd])
+    debug(f"Sent {master_fd=}")
 
     pid = os.fork()
     if pid == 0:
@@ -146,26 +169,32 @@ def _spawn(payload, conn, mode, winsz):
 	# controlling terminal and stdin/out/err
         _login_tty(slave_fd)
 
+        _setup_tstp(remote_pid)
+
         _run_payload(payload)
 
         exit(0)
     else:
+#        signal.signal(signal.SIGCHLD, _handle_chld)
+
         # parent (the control monitor)
+        os.close(master_fd) # because we've sent it back to the client
         os.close(slave_fd)
 
-	# shovel messages between our STDIN/STDOUT and the pty
-        _communicate(STDIN, master_fd, master_fd, STDOUT)
+        _send_object(conn.fileno(), pid)
 
-#        # continue reading on the control socket, listening for any
-#        # window size change and other signals to deliver.
-#        fd = conn.makefile(encoding='utf-8')
-#        for line in fd:
-#            debug(f"CONTROL MSG: {line}")
-#        debug("_spawn() exiting.")
+#	# shovel messages between our STDIN/STDOUT and the pty
+#        _communicate(STDIN, master_fd, master_fd, STDOUT)
+
+        # continue reading on the control socket, listening for any
+        # window size change and other signals to deliver.
+        fd = conn.makefile(encoding='utf-8')
+        for line in fd:
+            debug(f"CONTROL MSG: {line}")
+        debug("_spawn() exiting.")
 
         # TODO: Should we kill the child process here?
 
-        os.close(master_fd)
         conn.close()
 
 def _server(preload, payload, timeout=None):
@@ -208,17 +237,19 @@ def _server(preload, payload, timeout=None):
                 sys.argv = _read_object(fd)
                 debug(f"{sys.argv=}")
 
-                # Next are the pipes to communicate with the master
-                msg, (stdin_r, stdout_w), _, _ = socket.recv_fds(conn, 10, maxfds=2)
-                debug(f"Received pipes {stdin_r=}, {stdout_w=}")
-
-                # Dup them as our stdin/stdout/stderr
-                os.dup2(stdin_r, STDIN)
-                os.dup2(stdout_w, STDOUT)
-#                os.dup2(stdout_w, STDERR)
-#                debug("Here!")
-                os.close(stdin_r)
-                os.close(stdout_w)
+                remote_pid = _read_object(fd)
+                debug(f"{remote_pid=}")
+#                # Next are the pipes to communicate with the master
+#                msg, (stdin_r, stdout_w), _, _ = socket.recv_fds(conn, 10, maxfds=2)
+#                debug(f"Received pipes {stdin_r=}, {stdout_w=}")
+#
+#                # Dup them as our stdin/stdout/stderr
+#                os.dup2(stdin_r, STDIN)
+#                os.dup2(stdout_w, STDOUT)
+##                os.dup2(stdout_w, STDERR)
+##                debug("Here!")
+#                os.close(stdin_r)
+#                os.close(stdout_w)
 
                 # Next is the window size info and tty attributes
                 debug(f"Receiving window size and tty attributes:")
@@ -226,7 +257,7 @@ def _server(preload, payload, timeout=None):
                 debug(f"{winsz=}")
 
                 # Now we fork the process attached to a new pty
-                _spawn(payload, conn, mode, winsz)
+                _spawn(payload, remote_pid, conn, mode, winsz)
                 exit(0)
 
             else:
@@ -260,10 +291,10 @@ def _send_object(fd, obj):
 
 def _send_msg(fd, data):
     # msg format: [length][payload]
-    _write(fd, struct.pack('I', len(data)))
-    _write(fd, data)
+    _writen(fd, struct.pack('I', len(data)))
+    _writen(fd, data)
 
-def _write(fd, data):
+def _writen(fd, data):
     """Write all the data to a descriptor."""
     while data:
         n = os.write(fd, data)
@@ -275,8 +306,9 @@ def _communicate(in_src, in_dest, out_src, out_dest):
     fds = [in_src, out_src]
     args = [fds, [], []]
     while True:
+        debug(f"_communicate: awaiting {fds=}")
         rfds = select.select(*args)[0]
-#        print(f"{rfds=}")
+        debug(f"_communicate: {rfds=}")
         if not rfds:
             return
         for (src, dest) in ((in_src, in_dest), (out_src, out_dest)):
@@ -286,17 +318,69 @@ def _communicate(in_src, in_dest, out_src, out_dest):
                 except OSError:
                     data = b""
                 if not data:
+                    debug(f"_communicate: removing {src=}")
                     fds.remove(src)
                     if src == in_src: # means STDIN has closed & we should terminate
                         args.append(0.5) # set timeout (but give it a chance for one final read)
                 else:
                     os.write(dest, data)
 
+def _copy(master_fd, master_read=_read, stdin_read=_read):
+    """Parent copy loop.
+    Copies
+            pty master -> standard output   (master_read)
+            standard input -> pty master    (stdin_read)"""
+    fds = [master_fd, STDIN_FILENO]
+    while fds:
+        rfds, _wfds, _xfds = select.select(fds, [], [])
+
+        if master_fd in rfds:
+            # Some OSes signal EOF by returning an empty byte string,
+            # some throw OSErrors.
+            try:
+                data = master_read(master_fd)
+            except OSError:
+                data = b""
+            if not data:  # Reached EOF.
+                return    # Assume the child process has exited and is
+                          # unreachable, so we clean up.
+                          # FIXME: the process can close stdout and still continue. we should start checking pid if this is closed...
+            else:
+                os.write(STDOUT_FILENO, data)
+
+        if STDIN_FILENO in rfds:
+            data = stdin_read(STDIN_FILENO)
+            if not data:
+                fds.remove(STDIN_FILENO)
+            else:
+                _writen(master_fd, data)
+
 #
 # Handling broken pipe-related errors:
 #   https://bugs.python.org/issue11380,#msg153320
 #
 
+def _setup_cont(remote_pid):
+    def _handle_cont(signum, frame):
+        debug(f"_handle_cont: Received {signum=} [{remote_pid=}]")
+        tty.setraw(STDIN)
+        os.kill(remote_pid, signal.SIGCONT)
+
+    signal.signal(signal.SIGCONT, _handle_cont)
+
+def _setup_cli_tstp(mode):
+    def _handle_cli_tstp(signum, frame):
+        debug(f"_handle_cli_tstp: Received {signum=}")
+        # restore tty before we put ourselves to sleep
+        termios.tcsetattr(STDIN, tty.TCSAFLUSH, mode)
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    signal.signal(signal.SIGTSTP, _handle_cli_tstp)
+
+#
+# Really useful explanation of how SIGTSTP SIGSTOP CTRL-Z work:
+#   https://news.ycombinator.com/item?id=8773740
+#
 def _connect(preload, payload, timeout=None):
     # try connecting to the UNIX socket. If successful, pass it our command
     # line (argv).  If connection is not successful, start the server.
@@ -311,31 +395,40 @@ def _connect(preload, payload, timeout=None):
     # send our command line
     _send_object(fd, sys.argv)
 
-    # now create and send the pipes over which we'll communicate
-    # stdin, stdout, stderr
-    stdin_r, stdin_w = os.pipe()
-    stdout_r, stdout_w = os.pipe()
-    socket.send_fds(client, [ b'pipes' ], [stdin_r, stdout_w])
-#    os.close(stdin_w)
-#    os.close(stdout_r)
+    # send our PID. The remote process will be controlling us
+    # (e.g., for things like CTRL-Z handling)
+    _send_object(fd, os.getpid())
 
     # Next is the local tty attributes and window size
     winsz = _getwinsize(STDOUT)
     mode = termios.tcgetattr(STDIN)
     _send_object(fd, (mode, winsz))
-#    _send_msg(client.fileno(), pickle.dumps((mode, winsz)))
 
-    # switch input to raw mode
-    # See here for _very_ useful info:
+    # get the master_fd of the pty we'll be writing to
+    _, (master_fd,), _, _ = socket.recv_fds(client, 10, maxfds=1)
+    debug(f"Received {master_fd=}")
+
+    # get the PID
+    remote_pid = _read_object(fd)
+    print(f"{remote_pid=}")
+
+    # set up SIGCONT handler to restart client_pid
+    _setup_cont(remote_pid)
+    _setup_cli_tstp(mode)
+
+    # switch our input to raw mode
+    # See here for _very_ useful info about raw mode:
     #   https://stackoverflow.com/questions/51509348/python-tty-setraw-ctrl-c-doesnt-work-getch
     tty.setraw(STDIN)
 
     # Now enter the communication forwarding loop
 #    os.write(stdin_w, b"Test, writing!\n")
     try:
-        _communicate(STDIN, stdin_w, stdout_r, STDOUT)
+#        _communicate(STDIN, master_fd, master_fd, STDOUT)
+        _copy(master_fd)
     finally:
         termios.tcsetattr(STDIN, tty.TCSAFLUSH, mode)
+    debug("CLIENT EXITING")
 #    if bkh:
 #        signal.signal(SIGWINCH, bkh)
 
