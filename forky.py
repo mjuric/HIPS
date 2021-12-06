@@ -112,10 +112,13 @@ def _login_tty(fd):
 
 def _run_payload(payload):
     print("Welcome to my echo chamber!")
+#    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
+    os.execl("/usr/bin/vim", "vim")
 
     import time, tqdm
     for _ in tqdm.tqdm(range(100), file=sys.stdout):
         time.sleep(0.1)
+        debug("#", end='', flush=True)
     for line in sys.stdin:
         print("ECHO:", line, end='')
         debug("RECEIVED:", line, end='')
@@ -140,13 +143,14 @@ import signal
 def _setup_tstp(remote_pid):
     def _handle_tstp(signum, frame):
         debug(f"_handle_tstp: Received {signum=} [{remote_pid=}]")
-        os.kill(os.getpgid(remote_pid), signal.SIGTSTP)
+        os.killpg(os.getpgid(remote_pid), signal.SIGTSTP)
         os.kill(os.getpid(), signal.SIGSTOP)
 
-    signal.signal(signal.SIGTSTP, _handle_tstp)
+#    signal.signal(signal.SIGTSTP, _handle_tstp)
+    signal.signal(signal.SIGTSTP, signal.SIG_DFL)
 
-#def _handle_chld(signum, frame):
-#    debug(f"CHLD Received {signum=}")
+def _handle_chld(signum, frame):
+    debug(f"CHLD Received {signum=}")
 
 def _spawn(payload, remote_pid, conn, mode, winsz):
     #
@@ -175,7 +179,7 @@ def _spawn(payload, remote_pid, conn, mode, winsz):
 
         exit(0)
     else:
-#        signal.signal(signal.SIGCHLD, _handle_chld)
+        signal.signal(signal.SIGCHLD, _handle_chld)
 
         # parent (the control monitor)
         os.close(master_fd) # because we've sent it back to the client
@@ -333,6 +337,7 @@ def _copy(master_fd, master_read=_read, stdin_read=_read):
     fds = [master_fd, STDIN_FILENO]
     while fds:
         rfds, _wfds, _xfds = select.select(fds, [], [])
+#        debug(f"{rfds=}")
 
         if master_fd in rfds:
             # Some OSes signal EOF by returning an empty byte string,
@@ -372,7 +377,11 @@ def _setup_cli_tstp(mode):
     def _handle_cli_tstp(signum, frame):
         debug(f"_handle_cli_tstp: Received {signum=}")
         # restore tty before we put ourselves to sleep
-        termios.tcsetattr(STDIN, tty.TCSAFLUSH, mode)
+        # PROBLEM (?): this occasionally triggers an termios.error: (4, 'Interrupted system call')
+        # and it looks like it isn't needed (does the shell restore the terminal for us?)
+        # it only happens when run under time, like `CLIENT=1 time -p python forky.py foo bar`
+        # Not sure what's going on here...
+        ## termios.tcsetattr(STDIN, tty.TCSAFLUSH, mode)
         os.kill(os.getpid(), signal.SIGSTOP)
 
     signal.signal(signal.SIGTSTP, _handle_cli_tstp)
