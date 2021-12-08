@@ -42,28 +42,6 @@ def _sigreset(saved_mask):
     """Restores signal mask."""
     signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
 
-def _winchset(slave_fd, saved_mask, handle_winch):
-    """Installs SIGWINCH handler. Returns old SIGWINCH
-    handler if relevant; returns None otherwise."""
-    bkh = None
-    if handle_winch:
-        def _hwinch(signum, frame):
-            """SIGWINCH handler."""
-            _sigblock()
-            new_slave_fd = os.open(slave_path, os.O_RDWR)
-            tty.setwinsize(new_slave_fd, tty.getwinsize(STDIN_FILENO))
-            os.close(new_slave_fd)
-            _sigreset(saved_mask)
-
-        slave_path = os.ttyname(slave_fd)
-        try:
-            # Raises ValueError if not called from main thread.
-            bkh = signal.signal(SIGWINCH, _hwinch)
-        except ValueError:
-            pass
-
-    return bkh
-
 def openpty(mode=None, winsz=None):
     """openpty() -> (master_fd, slave_fd)
     Open a pty master/slave pair, using os.openpty() if possible."""
@@ -428,6 +406,21 @@ def _setup_cli_tstp(mode):
 
     signal.signal(signal.SIGTSTP, _handle_cli_tstp)
 
+def _setup_winch(master_fd):
+    """Sets up SIGWINCH handler which:
+      * gets the new size from our terminal
+      * sets the same size on PTY (which will trigger a SIGWINCH)
+        on the remote process.
+    """
+    def _copy_ws(signum, frame):
+        """SIGWINCH handler."""
+        s = fcntl.ioctl(STDOUT, termios.TIOCGWINSZ, '\0'*8)
+        #debug(f"CLIENT: _copy_ws:", struct.unpack("HHHH", s))
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
+        #debug("CLIENT: exiting _copy_ws")
+
+    return signal.signal(signal.SIGWINCH, _copy_ws)
+
 #
 # Really useful explanation of how SIGTSTP SIGSTOP CTRL-Z work:
 #   https://news.ycombinator.com/item?id=8773740
@@ -459,13 +452,18 @@ def _connect(preload, payload, timeout=None):
     _, (master_fd,), _, _ = socket.recv_fds(client, 10, maxfds=1)
     debug(f"Received {master_fd=}")
 
+    # get the pty device (for window size management)
+
     # get the PID
     remote_pid = _read_object(fd)
     print(f"{remote_pid=}")
 
-    # set up SIGCONT handler to restart client_pid
+    # set up SIGTSTP/SIGCONT handlers to stop/restart the remote process
     _setup_cont(remote_pid)
     _setup_cli_tstp(mode)
+
+    # set up the SIGWINCH handler
+    _setup_winch(master_fd)
 
     # switch our input to raw mode
     # See here for _very_ useful info about raw mode:
@@ -473,9 +471,7 @@ def _connect(preload, payload, timeout=None):
     tty.setraw(STDIN)
 
     # Now enter the communication forwarding loop
-#    os.write(stdin_w, b"Test, writing!\n")
     try:
-#        _communicate(STDIN, master_fd, master_fd, STDOUT)
         _copy(master_fd)
     finally:
         termios.tcsetattr(STDIN, tty.TCSAFLUSH, mode)
