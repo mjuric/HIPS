@@ -112,13 +112,15 @@ def _login_tty(fd):
 
 def _run_payload(payload):
     print("Welcome to my echo chamber!")
-#    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
-    os.execl("/usr/bin/vim", "vim")
+    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
+#    os.execl("/usr/bin/vim", "vim")
+#    os.execl("/usr/bin/sleep", "sleep", "600")
+#    os.execl("/usr/bin/stty", "stty", "-a")
 
-    import time, tqdm
-    for _ in tqdm.tqdm(range(100), file=sys.stdout):
-        time.sleep(0.1)
-        debug("#", end='', flush=True)
+#    import time, tqdm
+#    for _ in tqdm.tqdm(range(100), file=sys.stdout):
+#        time.sleep(0.1)
+#        debug("#", end='', flush=True)
     for line in sys.stdin:
         print("ECHO:", line, end='')
         debug("RECEIVED:", line, end='')
@@ -146,8 +148,7 @@ def _setup_tstp(remote_pid):
         os.killpg(os.getpgid(remote_pid), signal.SIGTSTP)
         os.kill(os.getpid(), signal.SIGSTOP)
 
-#    signal.signal(signal.SIGTSTP, _handle_tstp)
-    signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+    signal.signal(signal.SIGTSTP, _handle_tstp)
 
 def _handle_chld(signum, frame):
     debug(f"CHLD Received {signum=}")
@@ -164,41 +165,82 @@ def _spawn(payload, remote_pid, conn, mode, winsz):
     socket.send_fds(conn, [ b'm' ], [master_fd])
     debug(f"Sent {master_fd=}")
 
+    # make us the session leader, and make slave_fd our 
+    # controlling terminal and dup it to stdin/out/err
+    _login_tty(slave_fd)
+    debug(f"{os.tcgetpgrp(0)=} {os.getpid()=}")
+
+    # now for the payload process
+    r, w = os.pipe()
+    debug(f"PIPE: {r=}, {w=}")
     pid = os.fork()
     if pid == 0:
-        # child
-        os.close(master_fd)
+        debug(f"CHILD: {os.getpid()=}")
+        # wait until the parent sets us up
+        os.close(w)
+        debug("CHILD: waiting for parent setup")
+        while not len(os.read(r, 1)):
+            pass
+        debug("CHILD: unblocked!")
+        os.close(r)
 
-	# make us the session leader, and slave_fd our 
-	# controlling terminal and stdin/out/err
-        _login_tty(slave_fd)
+#        # temporary...
+#        _setup_tstp(remote_pid)
 
-        _setup_tstp(remote_pid)
-
+        # run the payload
         _run_payload(payload)
 
+        debug("CHILD: exiting!")
         exit(0)
     else:
+        debug(f"PARENT: {os.getpid()=} {r=} {w=}")
+#        os.close(slave_fd) # becayse we've sent it to the child
+        os.close(r)
+
+        # start a new process group
+        debug("setpgid")
+        os.setpgid(pid, pid)
+
+        # set child's process group as the foreground group
+        debug("os.tcsetpgrp")
+        os.tcsetpgrp(STDIN, pid)
+
+        # set up the monitor for the child's sleep/death
         signal.signal(signal.SIGCHLD, _handle_chld)
 
-        # parent (the control monitor)
-        os.close(master_fd) # because we've sent it back to the client
-        os.close(slave_fd)
-
+        # now that we're all set up, sent the 
+        # child PID back to the client
         _send_object(conn.fileno(), pid)
 
-#	# shovel messages between our STDIN/STDOUT and the pty
-#        _communicate(STDIN, master_fd, master_fd, STDOUT)
+        # unblock the child by closing the pipe
+        os.write(w, b"x")
+        os.close(w)
 
-        # continue reading on the control socket, listening for any
-        # window size change and other signals to deliver.
-        fd = conn.makefile(encoding='utf-8')
-        for line in fd:
-            debug(f"CONTROL MSG: {line}")
-        debug("_spawn() exiting.")
+        # https://stackoverflow.com/questions/39962707/wait-does-not-return-after-child-received-sigstop
+        # TODO: loop here calling waitpid(-1, 0, WUNTRACED) to handle
+        # the child's SIGSTOP (by SIGSTOP-ing the remote_pid) and death (just exit)
+        # Really good explanation: https://stackoverflow.com/a/34845669
+        while True:
+            debug(f"SENTRY: waitpid on {pid=}")
+            _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
+            # stopped?
+            debug(f"SENTRY: waitpid returned {status=}")
+            if os.WIFSTOPPED(status):
+                # make the controller's process group go to sleep
+                # why not just the controller? Because it may have been invoked
+                # by something like `time foo ...` and in fact runs in a process
+                # group
+                debug(f"SENTRY: WIFSTOPPED=True, sending SIGTSTP to pgid={os.getpgid(remote_pid)}")
+                os.killpg(os.getpgid(remote_pid), signal.SIGTSTP)
+            elif os.WIFEXITED(status):
+                # we've exited. return the retcode back to the controller
+                exitcode = os.WEXITSTATUS(status)
+                debug(f"SENTRY: WEXITED=True, sending {exitcode=} back to controller.")
+                _send_object(conn.fileno(), exitcode)
+                break
 
-        # TODO: Should we kill the child process here?
-
+        debug(f"SENTRY: Closing pty, sockets, and leaving.")
+        os.close(master_fd)
         conn.close()
 
 def _server(preload, payload, timeout=None):
@@ -437,9 +479,12 @@ def _connect(preload, payload, timeout=None):
         _copy(master_fd)
     finally:
         termios.tcsetattr(STDIN, tty.TCSAFLUSH, mode)
-    debug("CLIENT EXITING")
-#    if bkh:
-#        signal.signal(SIGWINCH, bkh)
+    debug(f"CLIENT EXITING, awaiting retcode")
+
+    retcode = _read_object(fd)
+    debug(f"CLIENT: received {retcode=}")
+
+    exit(retcode)
 
 def run(module, func):
     # check if we're already running
