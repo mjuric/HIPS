@@ -188,12 +188,13 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
                 # by something like `time foo ...` and in fact runs in a process
                 # group
 #                debug(f"SENTRY: WIFSTOPPED=True, sending SIGTSTP to pgid={os.getpgid(remote_pid)}")
-                os.killpg(os.getpgid(remote_pid), signal.SIGTSTP)
+#                os.killpg(os.getpgid(remote_pid), signal.SIGTSTP)
+                _send_object(conn.fileno(), ("stopped", 0))
             elif os.WIFEXITED(status):
                 # we've exited. return the retcode back to the controller
                 exitcode = os.WEXITSTATUS(status)
 #                debug(f"SENTRY: WEXITED=True, sending {exitcode=} back to controller.")
-                _send_object(conn.fileno(), exitcode)
+                _send_object(conn.fileno(), ("exited", exitcode))
                 break
 
 #        debug(f"SENTRY: Closing pty, sockets, and leaving.")
@@ -328,12 +329,12 @@ def _communicate(in_src, in_dest, out_src, out_dest):
                 else:
                     os.write(dest, data)
 
-def _copy(master_fd, master_read=_read, stdin_read=_read):
+def _copy(master_fd, control_fd, termios_attr, remote_pid):
     """Parent copy loop.
     Copies
             pty master -> standard output   (master_read)
             standard input -> pty master    (stdin_read)"""
-    fds = [master_fd, STDIN_FILENO]
+    fds = [master_fd, STDIN_FILENO, control_fd]
     while fds:
         rfds, _wfds, _xfds = select.select(fds, [], [])
 #        debug(f"{rfds=}")
@@ -342,22 +343,50 @@ def _copy(master_fd, master_read=_read, stdin_read=_read):
             # Some OSes signal EOF by returning an empty byte string,
             # some throw OSErrors.
             try:
-                data = master_read(master_fd)
+                data = _read(master_fd)
             except OSError:
                 data = b""
             if not data:  # Reached EOF.
-                return    # Assume the child process has exited and is
-                          # unreachable, so we clean up.
-                          # FIXME: the process can close stdout and still continue. we should start checking pid if this is closed...
+                debug("CLIENT: zero read on master_fd")
+                fds.remove(master_fd)
+#                return    # Assume the child process has exited and is
+#                          # unreachable, so we clean up.
+#                          # FIXME: the process can close stdout and still continue. we should start checking pid if this is closed...
             else:
                 os.write(STDOUT_FILENO, data)
 
         if STDIN_FILENO in rfds:
-            data = stdin_read(STDIN_FILENO)
+            data = _read(STDIN_FILENO)
             if not data:
                 fds.remove(STDIN_FILENO)
             else:
                 _writen(master_fd, data)
+
+        if control_fd in rfds:
+            # a control message from the worker. they've
+            # paused, exited, etc.
+            event, data = _read_object(control_fd)
+            debug(f"CLIENT: received {event=}")
+            if event == "stopped":
+                termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)	# restore tty
+                debug("CLIENT: Putting us to sleep")
+                os.killpg(0, signal.SIGTSTP)				# put our process group to sleep
+
+                # this is where we sleep....
+                # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
+
+                debug("CLIENT: Awake again")
+                tty.setraw(STDIN)					# turn the STDIN raw again
+
+                # set terminal size (in case it changed while we slept)
+                s = fcntl.ioctl(STDOUT, termios.TIOCGWINSZ, '\0'*8)
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
+
+                os.kill(remote_pid, signal.SIGCONT)			# continue the worker process
+            elif event == "exited":
+                return data # data is the exitcode
+            else:
+                assert 0, "unknown control event {event}"
 
 #
 # Handling broken pipe-related errors:
@@ -446,8 +475,8 @@ def _connect(preload, payload, timeout=None):
     print(f"{remote_pid=}")
 
     # set up SIGTSTP/SIGCONT handlers to stop/restart the remote process
-    _setup_cont(remote_pid)
-    _setup_cli_tstp(termios_attr)
+#    _setup_cont(remote_pid)
+#    _setup_cli_tstp(termios_attr)
 
     # set up the SIGWINCH handler
     _setup_winch(master_fd)
@@ -459,14 +488,14 @@ def _connect(preload, payload, timeout=None):
 
     # Now enter the communication forwarding loop
     try:
-        _copy(master_fd)
+        retcode = _copy(master_fd, fd, termios_attr, remote_pid)
     finally:
         # restore our console
         termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)
-    debug(f"CLIENT EXITING, awaiting retcode")
+#    debug(f"CLIENT EXITING, awaiting retcode")
 
-    retcode = _read_object(fd)
-    debug(f"CLIENT: received {retcode=}")
+#    retcode = _read_object(fd)
+    debug(f"CLIENT: exited with {retcode=}")
 
     exit(retcode)
 
