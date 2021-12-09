@@ -1,8 +1,6 @@
 # FIXME:
 #  * Do we need to block/unblock signals in signal handlers?
-#  * We detect the child has exited by the file descriptor becoming closed. What if the child closes stdin/out manually?
 #  * Full and partial redirect handling
-#  * If the window size changes while the process is alseep, the process doesn't receive SIGWINCH (?)
 
 import socket, os, sys, array, struct, pickle, tty, fcntl, termios, select, signal
 
@@ -82,9 +80,9 @@ def _login_tty(fd):
 
 def _run_payload(payload):
     print("Welcome to my echo chamber!")
-    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
+#    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
 #    os.execl("/usr/bin/vim", "vim")
-#    os.execl("/usr/bin/sleep", "sleep", "600")
+    os.execl("/usr/bin/sleep", "sleep", "600")
 #    os.execl("/usr/bin/stty", "stty", "-a")
 
 #    import time, tqdm
@@ -176,12 +174,16 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
         # Loop here calling waitpid(-1, 0, WUNTRACED) to handle
         # the child's SIGSTOP (by SIGSTOP-ing the remote_pid) and death (just exit)
         # Really good explanation: https://stackoverflow.com/a/34845669
-        # FIXME: should we also handle exits via signals?
+        # FIXME: We should handle the case where remote_pid is killed, by
+        #        periodically timing out and checking if conn is still open...
+        #        Or, we could move all this into a SIGCHLD handler, and
+        #        constantly listen on conn?
+        #        Actually, we should do this: https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
         while True:
-#            debug(f"SENTRY: waitpid on {pid=}")
+            debug(f"SENTRY: waitpid on {pid=}")
             _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
             # stopped?
-#            debug(f"SENTRY: waitpid returned {status=}")
+            debug(f"SENTRY: waitpid returned {status=}")
             if os.WIFSTOPPED(status):
                 # make the controller's process group go to sleep
                 # why not just the controller? Because it may have been invoked
@@ -191,11 +193,15 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
 #                os.killpg(os.getpgid(remote_pid), signal.SIGTSTP)
                 _send_object(conn.fileno(), ("stopped", 0))
             elif os.WIFEXITED(status):
-                # we've exited. return the retcode back to the controller
-                exitcode = os.WEXITSTATUS(status)
-#                debug(f"SENTRY: WEXITED=True, sending {exitcode=} back to controller.")
-                _send_object(conn.fileno(), ("exited", exitcode))
+                # we've exited. return the status back to the controller
+                _send_object(conn.fileno(), ("exited", os.WEXITSTATUS(status)))
                 break
+            elif os.WIFSIGNALED(status):
+                # we've exited. return the status back to the controller
+                _send_object(conn.fileno(), ("signaled", os.WTERMSIG(status)))
+                break
+            else:
+                assert 0, f"weird {status=}"
 
 #        debug(f"SENTRY: Closing pty, sockets, and leaving.")
         os.close(master_fd)
@@ -243,17 +249,6 @@ def _server(preload, payload, timeout=None):
 
                 remote_pid = _read_object(fd)
                 debug(f"{remote_pid=}")
-#                # Next are the pipes to communicate with the master
-#                msg, (stdin_r, stdout_w), _, _ = socket.recv_fds(conn, 10, maxfds=2)
-#                debug(f"Received pipes {stdin_r=}, {stdout_w=}")
-#
-#                # Dup them as our stdin/stdout/stderr
-#                os.dup2(stdin_r, STDIN)
-#                os.dup2(stdout_w, STDOUT)
-##                os.dup2(stdout_w, STDERR)
-##                debug("Here!")
-#                os.close(stdin_r)
-#                os.close(stdout_w)
 
                 # Next is the window size info and tty attributes
                 debug(f"Receiving window size and tty attributes:")
@@ -304,31 +299,6 @@ def _writen(fd, data):
         n = os.write(fd, data)
         data = data[n:]
 
-def _communicate(in_src, in_dest, out_src, out_dest):
-    import select
-
-    fds = [in_src, out_src]
-    args = [fds, [], []]
-    while True:
-        debug(f"_communicate: awaiting {fds=}")
-        rfds = select.select(*args)[0]
-        debug(f"_communicate: {rfds=}")
-        if not rfds:
-            return
-        for (src, dest) in ((in_src, in_dest), (out_src, out_dest)):
-            if src in rfds:
-                try:
-                    data = _read(src)
-                except OSError:
-                    data = b""
-                if not data:
-                    debug(f"_communicate: removing {src=}")
-                    fds.remove(src)
-                    if src == in_src: # means STDIN has closed & we should terminate
-                        args.append(0.5) # set timeout (but give it a chance for one final read)
-                else:
-                    os.write(dest, data)
-
 def _copy(master_fd, control_fd, termios_attr, remote_pid):
     """Parent copy loop.
     Copies
@@ -368,9 +338,14 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
             event, data = _read_object(control_fd)
             debug(f"CLIENT: received {event=}")
             if event == "stopped":
+                # it's possible we've been backrounded by the time we got here,
+                # so ignore SIGTTOU while mode-setting. This can happen if someone sent
+                # us (the client) an explicit SIGTSTP.
+                signal.signal(signal.SIGTTOU, signal.SIG_IGN)
                 termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)	# restore tty
+                signal.signal(signal.SIGTTOU, signal.SIG_DFL)
                 debug("CLIENT: Putting us to sleep")
-                os.killpg(0, signal.SIGTSTP)				# put our process group to sleep
+                os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
 
                 # this is where we sleep....
                 # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
@@ -382,9 +357,16 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
                 s = fcntl.ioctl(STDOUT, termios.TIOCGWINSZ, '\0'*8)
                 fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
 
-                os.kill(remote_pid, signal.SIGCONT)			# continue the worker process
+                os.killpg(os.getpgid(remote_pid), signal.SIGCONT)	# wake up the worker process
             elif event == "exited":
-                return data # data is the exitcode
+                return data # data is the exitstatus
+            elif event == "signaled":
+#                return -1
+                signum = data  # data is the signal that terminated the worker
+                termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
+                # then restore its default handler and commit a copycat suicide
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
             else:
                 assert 0, "unknown control event {event}"
 
@@ -393,34 +375,50 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
 #   https://bugs.python.org/issue11380,#msg153320
 #
 
-def _setup_cont(remote_pid):
-    def _handle_cont(signum, frame):
-        debug(f"_handle_cont: Received {signum=} [{remote_pid=}]")
-        tty.setraw(STDIN)
-        os.kill(remote_pid, signal.SIGCONT)
+# modified from https://github.com/python/cpython/blob/3.10/Lib/tty.py#L18
+def setraw_except_ISIG(fd, when=tty.TCSAFLUSH):
+    """Put terminal into a raw mode."""
+    mode = tty.tcgetattr(fd)
+    mode[tty.IFLAG] = mode[tty.IFLAG] & ~(tty.BRKINT | tty.ICRNL | tty.INPCK | tty.ISTRIP | tty.IXON)
+    mode[tty.OFLAG] = mode[tty.OFLAG] & ~(tty.OPOST)
+    mode[tty.CFLAG] = mode[tty.CFLAG] & ~(tty.CSIZE | tty.PARENB)
+    mode[tty.CFLAG] = mode[tty.CFLAG] | tty.CS8
+    mode[tty.LFLAG] = mode[tty.LFLAG] & ~(tty.ECHO | tty.ICANON | tty.IEXTEN)
+    mode[tty.CC][tty.VMIN] = 1
+    mode[tty.CC][tty.VTIME] = 0
+    tty.tcsetattr(fd, when, mode)
 
-    signal.signal(signal.SIGCONT, _handle_cont)
+# we need to catch & pass on:
+# INTR, QUIT, SUSP, or DSUSP ==> SIGINT, SIGQUIT, SIGTSTP, SIGTERM
+# and then we need SIGCONT for recovery
+# See: https://www.gnu.org/software/libc/manual/html_node/Signal-Characters.html
+# See: https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html
 
-def _setup_cli_tstp(termios_attr):
-    def _handle_cli_tstp(signum, frame):
-        debug(f"_handle_cli_tstp: Received {signum=}")
-        # restore tty before we put ourselves to sleep
-        # PROBLEM (?): this occasionally triggers an termios.error: (4, 'Interrupted system call')
-        # and it looks like it isn't needed (does the shell restore the terminal for us?)
-        # it only happens when run under time, like `CLIENT=1 time -p python forky.py foo bar`
-        # Not sure what's going on here...
-        while True:
-            try:
-                termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)
-                debug("CLIENT: tcsetattr succeeded")
-                break
-            except termios.error as e:
-                debug(e)
-        debug("CLIENT: stopping myself")
-        sys.stderr.flush()
-        os.kill(os.getpid(), signal.SIGSTOP)
+#def _setup_cont(remote_pid):
+#    def _handle_cont(signum, frame):
+#        debug(f"_handle_cont: Received {signum=} [{remote_pid=}]")
+#        tty.setraw(STDIN)
+#        os.killpg(os.getpgid(remote_pid), signal.SIGCONT)
+#
+#    signal.signal(signal.SIGCONT, _handle_cont)
 
-    signal.signal(signal.SIGTSTP, _handle_cli_tstp)
+def _setup_signal_passthrough(remote_pid):
+    def _handle_ISIG(signum, frame):
+        debug(f"**** ISIG caught, {signum=}")
+
+        # pass on the signal to the remote process
+        os.killpg(os.getpgid(remote_pid), signum)
+
+        debug(f"**** Forwarded {signum=}")
+
+        # if the remote process handles the signal by suspending
+        # or terminating itself, we'll be told about it via
+        # the control socket (and can do the same).
+
+    # forward all signals that make sense to forward
+    fwd_signals = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP, signal.SIGCHLD, signal.SIGWINCH}
+    for signum in fwd_signals:
+        signal.signal(signum, _handle_ISIG)
 
 def _setup_winch(master_fd):
     """Sets up SIGWINCH handler which:
@@ -476,7 +474,7 @@ def _connect(preload, payload, timeout=None):
 
     # set up SIGTSTP/SIGCONT handlers to stop/restart the remote process
 #    _setup_cont(remote_pid)
-#    _setup_cli_tstp(termios_attr)
+    _setup_signal_passthrough(remote_pid)
 
     # set up the SIGWINCH handler
     _setup_winch(master_fd)
@@ -484,6 +482,7 @@ def _connect(preload, payload, timeout=None):
     # switch our input to raw mode
     # See here for _very_ useful info about raw mode:
     #   https://stackoverflow.com/questions/51509348/python-tty-setraw-ctrl-c-doesnt-work-getch
+#    setraw_except_ISIG(STDIN)
     tty.setraw(STDIN)
 
     # Now enter the communication forwarding loop
