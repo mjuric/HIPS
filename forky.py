@@ -34,20 +34,6 @@ def _setwinsize(fd, winsz):
     # winsz is a struct with "HHHH" signature, as returned by _getwinsize
     return fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
 
-def _newpty(termios_attr, winsz):
-    #
-    # Open a new pty with the given window size and termios spec
-    #
-
-    master_fd, slave_fd = os.openpty()
-    ##debug(f"{master_fd=}, {slave_fd=}")
-
-    termios.tcsetattr(slave_fd, termios.TCSAFLUSH, termios_attr)
-    _setwinsize(slave_fd, winsz)
-
-    ##debug(f"{os.ttyname(slave_fd)=}")
-    return master_fd, slave_fd
-
 def _login_tty(fd):
     """Prepare a terminal for a new login session.
     Makes the calling process a session leader; the tty of which
@@ -79,7 +65,7 @@ def _login_tty(fd):
 
 def _run_payload(payload):
     print("Welcome to my echo chamber!")
-#    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
+    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
 #    os.execl("/usr/bin/vim", "vim")
 #    os.execl("/usr/bin/sleep", "sleep", "600")
 #    os.execl("/usr/bin/stty", "stty", "-a")
@@ -103,17 +89,20 @@ def _run_payload(payload):
 
     exit(0)
 
-def _spawn(payload, remote_pid, conn, fp, termios_attr, winsz):
+def _spawn(payload, remote_pid, conn, fp):
     #
     # Spawn a child to execute the payload. The parent will
     # stay behind to communicate the child's status to the client.
     #
 
     # Open a new PTY and send it back to our ccontroller process
-    master_fd, slave_fd = _newpty(termios_attr, winsz)
+    master_fd, slave_fd = os.openpty()
 
-    # send back the master_fd
+    # send back the master_fd, wait for master to set it up and
+    # acknowledge.
     socket.send_fds(conn, [ b'm' ], [master_fd])
+    ok = _read_object(fp)
+    assert ok == "OK"
 
     # make us the session leader, and make slave_fd our 
     # controlling terminal and dup it to stdin/out/err
@@ -231,13 +220,8 @@ def _server(preload, payload, timeout=None):
                 remote_pid = _read_object(fp)
 #                debug(f"{remote_pid=}")
 
-                # Next is the window size info and tty attributes
-#                debug(f"Receiving window size and tty attributes:")
-                termios_attr, winsz = _read_object(fp)
-#                debug(f"{winsz=}")
-
                 # Now we fork the process attached to a new pty
-                return _spawn(payload, remote_pid, conn, fp, termios_attr, winsz)
+                return _spawn(payload, remote_pid, conn, fp)
             else:
                 conn.close()
 
@@ -362,21 +346,6 @@ def _setup_signal_passthrough(remote_pid):
     for signum in fwd_signals:
         signal.signal(signum, _handle_ISIG)
 
-def _setup_winch(master_fd):
-    """Sets up SIGWINCH handler which:
-      * gets the new size from our terminal
-      * sets the same size on PTY (which will trigger a SIGWINCH)
-        on the remote process.
-    """
-    def _copy_ws(signum, frame):
-        """SIGWINCH handler."""
-        s = fcntl.ioctl(STDOUT, termios.TIOCGWINSZ, '\0'*8)
-        #debug(f"CLIENT: _copy_ws:", struct.unpack("HHHH", s))
-        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
-        #debug("CLIENT: exiting _copy_ws")
-
-    return signal.signal(signal.SIGWINCH, _copy_ws)
-
 #
 # Really useful explanation of how SIGTSTP SIGSTOP CTRL-Z work:
 #   https://news.ycombinator.com/item?id=8773740
@@ -398,14 +367,13 @@ def _connect(preload, payload, timeout=None):
     # send our PID (FIXME: is this necessary?)
     _write_object(fp, os.getpid())
 
-    # Next is the local tty attributes and window size
-    winsz = _getwinsize(STDOUT)
-    termios_attr = termios.tcgetattr(STDIN)
-    _write_object(fp, (termios_attr, winsz))
-
     # get the master_fd of the pty we'll be writing to
+    # set up the initial mode and window size
     _, (master_fd,), _, _ = socket.recv_fds(client, 10, maxfds=1)
-#    debug(f"Received {master_fd=}")
+    termios_attr = termios.tcgetattr(STDIN)
+    termios.tcsetattr(master_fd, termios.TCSAFLUSH, termios_attr)
+    _setwinsize(master_fd, _getwinsize(STDOUT))
+    _write_object(fp, "OK")
 
     # get the PID
     remote_pid = _read_object(fp)
@@ -413,8 +381,12 @@ def _connect(preload, payload, timeout=None):
     # pass any signals we receive back to the worker
     _setup_signal_passthrough(remote_pid)
 
-    # set up the SIGWINCH handler, to monitor for window size changes
-    _setup_winch(master_fd)
+    # set up the SIGWINCH handler which copies terminal window changes
+    # to the pty
+    signal.signal(
+        signal.SIGWINCH,
+        lambda signum, frame: _setwinsize(master_fd, _getwinsize(STDOUT))
+    )
 
     try:
         # switch our input to raw mode
