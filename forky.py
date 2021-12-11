@@ -34,33 +34,6 @@ def _setwinsize(fd, winsz):
     # winsz is a struct with "HHHH" signature, as returned by _getwinsize
     return fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
 
-def _login_tty(fd):
-    """Prepare a terminal for a new login session.
-    Makes the calling process a session leader; the tty of which
-    fd is a file descriptor becomes the controlling tty, the stdin,
-    the stdout, and the stderr of the calling process."""
-
-    # Establish a new session.
-    os.setsid()
-
-    # The tty becomes the controlling terminal.
-    try:
-        fcntl.ioctl(fd, termios.TIOCSCTTY)
-    except (NameError, OSError):
-        # Fallback method; from Advanced Programming in the UNIX(R)
-        # Environment, Third edition, 2013, Section 9.6 - Controlling Terminal:
-        # "Systems derived from UNIX System V allocate the controlling
-        # terminal for a session when the session leader opens the first
-        # terminal device that is not already associated with a session, as
-        # long as the call to open does not specify the O_NOCTTY flag."
-        tmp_fd = os.open(os.ttyname(fd), os.O_RDWR)
-        os.close(tmp_fd)
-
-    # The tty becomes stdin/stdout/stderr.
-    os.dup2(fd, STDIN)
-    os.dup2(fd, STDOUT)
-#    os.dup2(fd, STDERR)
-
 #############################################################################
 
 def _run_payload(payload):
@@ -103,11 +76,16 @@ def _spawn(payload, remote_pid, conn, fp):
     socket.send_fds(conn, [ b'm' ], [master_fd])
     ok = _read_object(fp)
     assert ok == "OK"
+    os.close(master_fd) # master_fd is with the client now, so we can close it
 
     # make us the session leader, and make slave_fd our 
     # controlling terminal and dup it to stdin/out/err
-    _login_tty(slave_fd)
-    os.close(slave_fd) # as it's been duped to STDIN/OUT/ERR by _login_tty
+    os.setsid()
+    fcntl.ioctl(slave_fd, termios.TIOCSCTTY)
+    os.dup2(slave_fd, STDIN)
+    os.dup2(slave_fd, STDOUT)
+#    os.dup2(slave_fd, STDERR)
+    os.close(slave_fd)	# slave_fd has been duped to STDIN/OUT/ERR, so we can close it
 
     # the parent will set up the child's process group and terminal.
     # while that's going on, the child should wait and not execute
@@ -119,7 +97,6 @@ def _spawn(payload, remote_pid, conn, fp):
     pid = os.fork()
     if pid == 0:
         os.close(w)			# we'll only be reading
-        os.close(master_fd)		# slave_fd's already been dup2-ed to STDIN/OUT/ERR by _login_tty
         conn.close()			# we won't be directly communicating to the client
 
         # wait until the parent sets us up
@@ -131,6 +108,7 @@ def _spawn(payload, remote_pid, conn, fp):
         return _run_payload(payload)
     else:
         os.close(r)			# we'll only be writing
+        
         os.setpgid(pid, pid)		# start a new process group for the child
         os.tcsetpgrp(STDIN, pid)	# make the child's the foreground process group (so it receives tty input+signals)
 
@@ -171,7 +149,6 @@ def _spawn(payload, remote_pid, conn, fp):
                 assert 0, f"weird {status=}"
 
         # the child has exited; clean up and leave
-        os.close(master_fd)
         conn.close()
 
 def _server(preload, payload, timeout=None):
@@ -304,6 +281,7 @@ def _copy(master_fd, control_fd, control_fp, termios_attr, remote_pid):
                 s = fcntl.ioctl(STDOUT, termios.TIOCGWINSZ, '\0'*8)
                 fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
 
+                # FIXME: we should message the nanny to do this (pid race condition!)
                 os.killpg(os.getpgid(remote_pid), signal.SIGCONT)	# wake up the worker process
             elif event == "exited":
                 return data # data is the exitstatus
@@ -330,16 +308,14 @@ def _copy(master_fd, control_fd, control_fp, termios_attr, remote_pid):
 
 def _setup_signal_passthrough(remote_pid):
     def _handle_ISIG(signum, frame):
-#        debug(f"**** ISIG caught, {signum=}")
-
-        # pass on the signal to the remote process
-        os.killpg(os.getpgid(remote_pid), signum)
-
-#        debug(f"**** Forwarded {signum=}")
-
+        # just pass on the signal to the remote process
+        #
         # if the remote process handles the signal by suspending
         # or terminating itself, we'll be told about it via
         # the control socket (and can do the same).
+        #
+        # FIXME: this signaling should be done through the control socket (pid race contitions!)
+        os.killpg(os.getpgid(remote_pid), signum)
 
     # forward all signals that make sense to forward
     fwd_signals = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP, signal.SIGCHLD, signal.SIGWINCH}
