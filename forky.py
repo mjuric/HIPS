@@ -36,7 +36,7 @@ def _setwinsize(fd, winsz):
     s = struct.pack('HHHH', rows, cols, 0, 0)
     res = fcntl.ioctl(fd, termios.TIOCSWINSZ, s)
 
-def newpty(termios_attr, winsz):
+def _newpty(termios_attr, winsz):
     #
     # Open a new pty with the given window size and termios spec
     #
@@ -82,13 +82,13 @@ def _run_payload(payload):
     print("Welcome to my echo chamber!")
 #    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
 #    os.execl("/usr/bin/vim", "vim")
-    os.execl("/usr/bin/sleep", "sleep", "600")
+#    os.execl("/usr/bin/sleep", "sleep", "600")
 #    os.execl("/usr/bin/stty", "stty", "-a")
 
-#    import time, tqdm
-#    for _ in tqdm.tqdm(range(100), file=sys.stdout):
-#        time.sleep(0.1)
-#        debug("#", end='', flush=True)
+    import time, tqdm
+    for _ in tqdm.tqdm(range(100), file=sys.stdout):
+        time.sleep(0.1)
+        debug("#", end='', flush=True)
     for line in sys.stdin:
         print("ECHO:", line, end='')
         debug("RECEIVED:", line, end='')
@@ -111,7 +111,7 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
     #
 
     # Open a new PTY and send it back to our ccontroller process
-    master_fd, slave_fd = newpty(termios_attr, winsz)
+    master_fd, slave_fd = _newpty(termios_attr, winsz)
 #    debug(f"Opened PTY {master_fd=} {slave_fd=}")
 
     # send back the master_fd
@@ -184,6 +184,7 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
             _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
             # stopped?
             debug(f"SENTRY: waitpid returned {status=}")
+            debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
             if os.WIFSTOPPED(status):
                 # make the controller's process group go to sleep
                 # why not just the controller? Because it may have been invoked
@@ -200,6 +201,10 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
                 # we've exited. return the status back to the controller
                 _send_object(conn.fileno(), ("signaled", os.WTERMSIG(status)))
                 break
+            elif os.WIFCONTINUED(status):
+                # we've been continued after being stopped
+                # TODO: should we make sure the remote_pid is signaled to CONT?
+                pass
             else:
                 assert 0, f"weird {status=}"
 
@@ -345,7 +350,8 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
                 termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)	# restore tty
                 signal.signal(signal.SIGTTOU, signal.SIG_DFL)
                 debug("CLIENT: Putting us to sleep")
-                os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
+#                os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
+                os.kill(0, signal.SIGSTOP)			# put ourselves to sleep
 
                 # this is where we sleep....
                 # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
