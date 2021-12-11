@@ -2,7 +2,7 @@
 #  * Do we need to block/unblock signals in signal handlers?
 #  * Full and partial redirect handling
 
-import socket, os, sys, array, struct, pickle, tty, fcntl, termios, select, signal
+import socket, os, sys, array, struct, marshal, tty, fcntl, termios, select, signal
 
 # https://gist.github.com/jmhobbs/11276249
 socket_path = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'echo.socket')
@@ -16,25 +16,23 @@ def debug(*argv, **kwargs):
     return print(*argv, **kwargs)
 
 
+#############################################################################
 #
-# Pty management routines
+#   Pty management routines
 #
-
-# From http://computer-programming-forum.com/56-python/ef56832eb6f33ba3.htm
-# h, w = struct.unpack("hhhh", fcntl.ioctl(0, termios.TIOCGWINSZ ,"\000"*8))[0:2]
-#
+#############################################################################
 
 def _getwinsize(fd):
-    # Get terminal window size for file descriptor fd
-    h, w = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ ,"\000"*8))[0:2]
-    return h, w
+    # Return the terminal window size struct for file descriptor fd
+    # the contents are a struct w. "HHHH" signature, mapping to
+    # (rows, cols, ws_xpixel, ws_ypixel), but we don't bother
+    # to unpack as this will be bed back to _setwinsize.
+    return fcntl.ioctl(fd, termios.TIOCGWINSZ ,"\000"*8)
 
 def _setwinsize(fd, winsz):
     # Set window size of tty with file descriptor fd
-    # winsz is a (rows, cols) tuple
-    rows, cols = winsz
-    s = struct.pack('HHHH', rows, cols, 0, 0)
-    res = fcntl.ioctl(fd, termios.TIOCSWINSZ, s)
+    # winsz is a struct with "HHHH" signature, as returned by _getwinsize
+    return fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
 
 def _newpty(termios_attr, winsz):
     #
@@ -42,12 +40,12 @@ def _newpty(termios_attr, winsz):
     #
 
     master_fd, slave_fd = os.openpty()
-    debug(f"{master_fd=}, {slave_fd=}")
+    ##debug(f"{master_fd=}, {slave_fd=}")
 
     termios.tcsetattr(slave_fd, termios.TCSAFLUSH, termios_attr)
     _setwinsize(slave_fd, winsz)
 
-    debug(f"{os.ttyname(slave_fd)=}")
+    ##debug(f"{os.ttyname(slave_fd)=}")
     return master_fd, slave_fd
 
 def _login_tty(fd):
@@ -55,6 +53,7 @@ def _login_tty(fd):
     Makes the calling process a session leader; the tty of which
     fd is a file descriptor becomes the controlling tty, the stdin,
     the stdout, and the stderr of the calling process."""
+
     # Establish a new session.
     os.setsid()
 
@@ -76,7 +75,7 @@ def _login_tty(fd):
     os.dup2(fd, STDOUT)
 #    os.dup2(fd, STDERR)
 
-###########################################################################################
+#############################################################################
 
 def _run_payload(payload):
     print("Welcome to my echo chamber!")
@@ -99,30 +98,27 @@ def _run_payload(payload):
     # TODO: launch a dameon thread to receive messages over the control socket
     # This is how we'll receive screen resize mesages, etc., in the future.
 
-    print("Executing payload")
+#    print("Executing payload")
     exec(payload)
 
     exit(0)
 
-def _spawn(payload, remote_pid, conn, termios_attr, winsz):
+def _spawn(payload, remote_pid, conn, fp, termios_attr, winsz):
     #
     # Spawn a child to execute the payload. The parent will
-    # stay behind to pass on SIGSTOP and the exit code
+    # stay behind to communicate the child's status to the client.
     #
 
     # Open a new PTY and send it back to our ccontroller process
     master_fd, slave_fd = _newpty(termios_attr, winsz)
-#    debug(f"Opened PTY {master_fd=} {slave_fd=}")
 
     # send back the master_fd
     socket.send_fds(conn, [ b'm' ], [master_fd])
-#    debug(f"Sent {master_fd=}")
 
     # make us the session leader, and make slave_fd our 
     # controlling terminal and dup it to stdin/out/err
     _login_tty(slave_fd)
     os.close(slave_fd) # as it's been duped to STDIN/OUT/ERR by _login_tty
-#    debug(f"{os.tcgetpgrp(0)=} {os.getpid()=}")
 
     # the parent will set up the child's process group and terminal.
     # while that's going on, the child should wait and not execute
@@ -130,45 +126,28 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
     # a message via a pipe.
     r, w = os.pipe()
     
-#    debug(f"PIPE: {r=}, {w=}")
     # now fork the payload process
     pid = os.fork()
     if pid == 0:
-#        debug(f"CHILD: {os.getpid()=}")
-        os.close(w)
-        os.close(master_fd)
-        conn.close()
+        os.close(w)			# we'll only be reading
+        os.close(master_fd)		# slave_fd's already been dup2-ed to STDIN/OUT/ERR by _login_tty
+        conn.close()			# we won't be directly communicating to the client
 
         # wait until the parent sets us up
-#        debug("CHILD: waiting for parent setup")
         while not len(os.read(r, 1)):
             pass
-#        debug("CHILD: unblocked!")
         os.close(r)
 
         # run the payload
-        _run_payload(payload)
-
-#        debug("CHILD: exiting!")
-        exit(0)
+        return _run_payload(payload)
     else:
-##        debug(f"PARENT: {os.getpid()=} {r=} {w=}")
-        os.close(r)
+        os.close(r)			# we'll only be writing
+        os.setpgid(pid, pid)		# start a new process group for the child
+        os.tcsetpgrp(STDIN, pid)	# make the child's the foreground process group (so it receives tty input+signals)
 
-        # start a new process group
-#        debug("setpgid")
-        os.setpgid(pid, pid)
+        _write_object(fp, pid)		# send the child's PID back to the client
 
-        # set child's process group as the foreground group
-#        debug("os.tcsetpgrp")
-        os.tcsetpgrp(STDIN, pid)
-
-        # now that we're all set up, sent the 
-        # child PID back to the client
-        _send_object(conn.fileno(), pid)
-
-        # unblock the child by writing, then closing the pipe
-        os.write(w, b"x")
+        os.write(w, b"x")		# unblock the child, close the pipe
         os.close(w)
 
         # Loop here calling waitpid(-1, 0, WUNTRACED) to handle
@@ -180,26 +159,20 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
         #        constantly listen on conn?
         #        Actually, we should do this: https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
         while True:
-            debug(f"SENTRY: waitpid on {pid=}")
+            ##debug(f"SENTRY: waitpid on {pid=}")
             _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-            # stopped?
-            debug(f"SENTRY: waitpid returned {status=}")
-            debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
+            ##debug(f"SENTRY: waitpid returned {status=}")
+            ##debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
             if os.WIFSTOPPED(status):
-                # make the controller's process group go to sleep
-                # why not just the controller? Because it may have been invoked
-                # by something like `time foo ...` and in fact runs in a process
-                # group
-#                debug(f"SENTRY: WIFSTOPPED=True, sending SIGTSTP to pgid={os.getpgid(remote_pid)}")
-#                os.killpg(os.getpgid(remote_pid), signal.SIGTSTP)
-                _send_object(conn.fileno(), ("stopped", 0))
+                # let the controller know we've stopped
+                _write_object(fp, ("stopped", 0))
             elif os.WIFEXITED(status):
                 # we've exited. return the status back to the controller
-                _send_object(conn.fileno(), ("exited", os.WEXITSTATUS(status)))
+                _write_object(fp, ("exited", os.WEXITSTATUS(status)))
                 break
             elif os.WIFSIGNALED(status):
                 # we've exited. return the status back to the controller
-                _send_object(conn.fileno(), ("signaled", os.WTERMSIG(status)))
+                _write_object(fp, ("signaled", os.WTERMSIG(status)))
                 break
             elif os.WIFCONTINUED(status):
                 # we've been continued after being stopped
@@ -208,16 +181,15 @@ def _spawn(payload, remote_pid, conn, termios_attr, winsz):
             else:
                 assert 0, f"weird {status=}"
 
-#        debug(f"SENTRY: Closing pty, sockets, and leaving.")
+        # the child has exited; clean up and leave
         os.close(master_fd)
         conn.close()
 
 def _server(preload, payload, timeout=None):
-    debug(f"Executing preload")
+    # Execute preload code
     exec(preload)
-    debug("Done.")
 
-    # handle the race condition where two programs are launched
+    # avoid the race condition where two programs are launched
     # at the same time, and try to create the same socket. We'll create
     # our socket in {socket_path}.{pid}, then mv to {socket_path}.
     # that way, the last process wins.
@@ -226,13 +198,15 @@ def _server(preload, payload, timeout=None):
     if os.path.exists(spath):
         os.unlink(spath)
 
-    debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
+#    debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         sock.bind(spath)
         sock.listen()
         os.rename(spath, socket_path)
-        debug(' done.')
+#        debug(' done.')
+
+        # Await for client connections
         while True:
             try:
                 conn, _ = sock.accept()
@@ -240,63 +214,46 @@ def _server(preload, payload, timeout=None):
                 debug("Server timeout. Exiting")
                 exit(0)
 
-            debug(f"Connection accepted")
+#            debug(f"Connection accepted")
+            # connection accepted. Fork a child process to handle the work.
             pid = os.fork()
             if pid == 0:
                 # Child process
-                debug(f"Forked child at {os.getpid()=}")
+                #debug(f"Forked child at {os.getpid()=}")
                 sock.close()
-                fd = conn.fileno()
+                fp = conn.makefile(mode='rwb', buffering=0)
 
-                # get command line
-                sys.argv = _read_object(fd)
-                debug(f"{sys.argv=}")
+                # receive the command line
+                sys.argv = _read_object(fp)
+#                debug(f"{sys.argv=}")
 
-                remote_pid = _read_object(fd)
-                debug(f"{remote_pid=}")
+                # receive the client PID (FIXME: we don't really use this)
+                remote_pid = _read_object(fp)
+#                debug(f"{remote_pid=}")
 
                 # Next is the window size info and tty attributes
-                debug(f"Receiving window size and tty attributes:")
-                termios_attr, winsz = _read_object(fd)
-                debug(f"{winsz=}")
+#                debug(f"Receiving window size and tty attributes:")
+                termios_attr, winsz = _read_object(fp)
+#                debug(f"{winsz=}")
 
                 # Now we fork the process attached to a new pty
-                _spawn(payload, remote_pid, conn, termios_attr, winsz)
-                exit(0)
-
+                return _spawn(payload, remote_pid, conn, fp, termios_attr, winsz)
             else:
-                # Server
                 conn.close()
 
-def _read(fd):
-    """Default read function."""
-    return os.read(fd, 1024)
+#############################################################################
+#
+#   Control socket communication routines
+#
+#############################################################################
 
-def _read_n(fd, length):
-    """Read exactly length bytes"""
-    b = os.read(fd, length)
-#    debug(f"{b=}")
-    while len(b) != length:
-        b += os.read(fd, len(b)-length)
-    return b
+def _read_object(fp):
+    """ Read a marshaled object from file fp """
+    return marshal.load(fp)
 
-def _read_object(fd):
-    return pickle.loads(_read_msg(fd))
-
-def _read_msg(fd):
-    msglen, = struct.unpack('I', _read_n(fd, 4))
-#    debug(f"Message length is {msglen=}")
-    msg = _read_n(fd, msglen)
-#    debug(f"Raw message is {msg=}")
-    return msg
-
-def _send_object(fd, obj):
-    return _send_msg(fd, pickle.dumps(obj, -1))
-
-def _send_msg(fd, data):
-    # msg format: [length][payload]
-    _writen(fd, struct.pack('I', len(data)))
-    _writen(fd, data)
+def _write_object(fp, obj):
+    """ Write an object to file fp, using marshal """
+    return marshal.dump(obj, fp)
 
 def _writen(fd, data):
     """Write all the data to a descriptor."""
@@ -304,11 +261,14 @@ def _writen(fd, data):
         n = os.write(fd, data)
         data = data[n:]
 
-def _copy(master_fd, control_fd, termios_attr, remote_pid):
-    """Parent copy loop.
+def _copy(master_fd, control_fd, control_fp, termios_attr, remote_pid):
+    """Copy and control loop
     Copies
             pty master -> standard output   (master_read)
-            standard input -> pty master    (stdin_read)"""
+            standard input -> pty master    (stdin_read)
+    and also listens for control messages from the child
+    on control_fd/fp.
+    """
     fds = [master_fd, STDIN_FILENO, control_fd]
     while fds:
         rfds, _wfds, _xfds = select.select(fds, [], [])
@@ -318,20 +278,17 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
             # Some OSes signal EOF by returning an empty byte string,
             # some throw OSErrors.
             try:
-                data = _read(master_fd)
+                data = os.read(master_fd, 1024)
             except OSError:
                 data = b""
             if not data:  # Reached EOF.
-                debug("CLIENT: zero read on master_fd")
+#                debug("CLIENT: zero read on master_fd")
                 fds.remove(master_fd)
-#                return    # Assume the child process has exited and is
-#                          # unreachable, so we clean up.
-#                          # FIXME: the process can close stdout and still continue. we should start checking pid if this is closed...
             else:
                 os.write(STDOUT_FILENO, data)
 
         if STDIN_FILENO in rfds:
-            data = _read(STDIN_FILENO)
+            data = os.read(STDIN_FILENO, 1024)
             if not data:
                 fds.remove(STDIN_FILENO)
             else:
@@ -340,8 +297,8 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
         if control_fd in rfds:
             # a control message from the worker. they've
             # paused, exited, etc.
-            event, data = _read_object(control_fd)
-            debug(f"CLIENT: received {event=}")
+            event, data = _read_object(control_fp)
+#            debug(f"CLIENT: received {event=}")
             if event == "stopped":
                 # it's possible we've been backrounded by the time we got here,
                 # so ignore SIGTTOU while mode-setting. This can happen if someone sent
@@ -349,14 +306,14 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
                 signal.signal(signal.SIGTTOU, signal.SIG_IGN)
                 termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)	# restore tty
                 signal.signal(signal.SIGTTOU, signal.SIG_DFL)
-                debug("CLIENT: Putting us to sleep")
+#                debug("CLIENT: Putting us to sleep")
 #                os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
                 os.kill(0, signal.SIGSTOP)			# put ourselves to sleep
 
                 # this is where we sleep....
                 # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
 
-                debug("CLIENT: Awake again")
+#                debug("CLIENT: Awake again")
                 tty.setraw(STDIN)					# turn the STDIN raw again
 
                 # set terminal size (in case it changed while we slept)
@@ -381,41 +338,20 @@ def _copy(master_fd, control_fd, termios_attr, remote_pid):
 #   https://bugs.python.org/issue11380,#msg153320
 #
 
-# modified from https://github.com/python/cpython/blob/3.10/Lib/tty.py#L18
-def setraw_except_ISIG(fd, when=tty.TCSAFLUSH):
-    """Put terminal into a raw mode."""
-    mode = tty.tcgetattr(fd)
-    mode[tty.IFLAG] = mode[tty.IFLAG] & ~(tty.BRKINT | tty.ICRNL | tty.INPCK | tty.ISTRIP | tty.IXON)
-    mode[tty.OFLAG] = mode[tty.OFLAG] & ~(tty.OPOST)
-    mode[tty.CFLAG] = mode[tty.CFLAG] & ~(tty.CSIZE | tty.PARENB)
-    mode[tty.CFLAG] = mode[tty.CFLAG] | tty.CS8
-    mode[tty.LFLAG] = mode[tty.LFLAG] & ~(tty.ECHO | tty.ICANON | tty.IEXTEN)
-    mode[tty.CC][tty.VMIN] = 1
-    mode[tty.CC][tty.VTIME] = 0
-    tty.tcsetattr(fd, when, mode)
-
 # we need to catch & pass on:
 # INTR, QUIT, SUSP, or DSUSP ==> SIGINT, SIGQUIT, SIGTSTP, SIGTERM
 # and then we need SIGCONT for recovery
 # See: https://www.gnu.org/software/libc/manual/html_node/Signal-Characters.html
 # See: https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html
 
-#def _setup_cont(remote_pid):
-#    def _handle_cont(signum, frame):
-#        debug(f"_handle_cont: Received {signum=} [{remote_pid=}]")
-#        tty.setraw(STDIN)
-#        os.killpg(os.getpgid(remote_pid), signal.SIGCONT)
-#
-#    signal.signal(signal.SIGCONT, _handle_cont)
-
 def _setup_signal_passthrough(remote_pid):
     def _handle_ISIG(signum, frame):
-        debug(f"**** ISIG caught, {signum=}")
+#        debug(f"**** ISIG caught, {signum=}")
 
         # pass on the signal to the remote process
         os.killpg(os.getpgid(remote_pid), signum)
 
-        debug(f"**** Forwarded {signum=}")
+#        debug(f"**** Forwarded {signum=}")
 
         # if the remote process handles the signal by suspending
         # or terminating itself, we'll be told about it via
@@ -454,55 +390,45 @@ def _connect(preload, payload, timeout=None):
     # try connecting
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(socket_path)
-    fd = client.fileno()
+    fp = client.makefile(mode='rwb', buffering=0)
 
     # send our command line
-    _send_object(fd, sys.argv)
+    _write_object(fp, sys.argv)
 
-    # send our PID. The remote process will be controlling us
-    # (e.g., for things like CTRL-Z handling)
-    _send_object(fd, os.getpid())
+    # send our PID (FIXME: is this necessary?)
+    _write_object(fp, os.getpid())
 
     # Next is the local tty attributes and window size
     winsz = _getwinsize(STDOUT)
     termios_attr = termios.tcgetattr(STDIN)
-    _send_object(fd, (termios_attr, winsz))
+    _write_object(fp, (termios_attr, winsz))
 
     # get the master_fd of the pty we'll be writing to
     _, (master_fd,), _, _ = socket.recv_fds(client, 10, maxfds=1)
-    debug(f"Received {master_fd=}")
-
-    # get the pty device (for window size management)
+#    debug(f"Received {master_fd=}")
 
     # get the PID
-    remote_pid = _read_object(fd)
-    print(f"{remote_pid=}")
+    remote_pid = _read_object(fp)
 
-    # set up SIGTSTP/SIGCONT handlers to stop/restart the remote process
-#    _setup_cont(remote_pid)
+    # pass any signals we receive back to the worker
     _setup_signal_passthrough(remote_pid)
 
-    # set up the SIGWINCH handler
+    # set up the SIGWINCH handler, to monitor for window size changes
     _setup_winch(master_fd)
 
-    # switch our input to raw mode
-    # See here for _very_ useful info about raw mode:
-    #   https://stackoverflow.com/questions/51509348/python-tty-setraw-ctrl-c-doesnt-work-getch
-#    setraw_except_ISIG(STDIN)
-    tty.setraw(STDIN)
-
-    # Now enter the communication forwarding loop
     try:
-        retcode = _copy(master_fd, fd, termios_attr, remote_pid)
+        # switch our input to raw mode
+        # See here for _very_ useful info about raw mode:
+        #   https://stackoverflow.com/questions/51509348/python-tty-setraw-ctrl-c-doesnt-work-getch
+        tty.setraw(STDIN)
+
+        # Now enter the communication forwarding loop
+        exitcode = _copy(master_fd, client.fileno(), fp, termios_attr, remote_pid)
     finally:
         # restore our console
         termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)
-#    debug(f"CLIENT EXITING, awaiting retcode")
 
-#    retcode = _read_object(fd)
-    debug(f"CLIENT: exited with {retcode=}")
-
-    exit(retcode)
+    return exitcode
 
 def run(module, func):
     # check if we're already running
@@ -510,6 +436,8 @@ def run(module, func):
 
 if __name__ == "__main__":
     if os.environ.get("CLIENT", None):
-        _connect("", "")
+        ret = _connect("", "")
     else:
-        _server("import dask.distributed", "print('Hello World!')")
+        ret = _server("import dask.distributed", "print('Hello World!')")
+
+    exit(ret)
