@@ -38,15 +38,15 @@ def _setwinsize(fd, winsz):
 
 def _run_payload(payload):
     print("Welcome to my echo chamber!")
-    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
+#    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
 #    os.execl("/usr/bin/vim", "vim")
 #    os.execl("/usr/bin/sleep", "sleep", "600")
 #    os.execl("/usr/bin/stty", "stty", "-a")
 
     import time, tqdm
-    for _ in tqdm.tqdm(range(100), file=sys.stdout):
+    for _ in tqdm.tqdm(range(100)):
         time.sleep(0.1)
-        debug("#", end='', flush=True)
+#        debug("#", end='', flush=True)
     for line in sys.stdin:
         print("ECHO:", line, end='')
         debug("RECEIVED:", line, end='')
@@ -62,30 +62,56 @@ def _run_payload(payload):
 
     exit(0)
 
-def _spawn(payload, remote_pid, conn, fp):
+def _spawn(payload, conn):
     #
     # Spawn a child to execute the payload. The parent will
     # stay behind to communicate the child's status to the client.
     #
 
-    # Open a new PTY and send it back to our ccontroller process
-    master_fd, slave_fd = os.openpty()
+    # make our life easier & create a file-like object
+    fp = conn.makefile(mode='rwb', buffering=0)
 
-    # send back the master_fd, wait for master to set it up and
-    # acknowledge.
-    socket.send_fds(conn, [ b'm' ], [master_fd])
-    ok = _read_object(fp)
-    assert ok == "OK"
-    os.close(master_fd) # master_fd is with the client now, so we can close it
+    # File descriptors that we should directly dup2-licate
+    fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
+    debug(f"{fdidx=}")
+    if len(fdidx):
+        _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=len(fdidx))
+    else:
+        fds = []
+    debug(f"{fds=}")
+    for a, b in zip(fds, fdidx):
+        debug(f"_spawn: duplicating fd {a} to {b}")
+        os.dup2(a, b)
 
-    # make us the session leader, and make slave_fd our 
-    # controlling terminal and dup it to stdin/out/err
-    os.setsid()
-    fcntl.ioctl(slave_fd, termios.TIOCSCTTY)
-    os.dup2(slave_fd, STDIN)
-    os.dup2(slave_fd, STDOUT)
-#    os.dup2(slave_fd, STDERR)
-    os.close(slave_fd)	# slave_fd has been duped to STDIN/OUT/ERR, so we can close it
+    # receive the command line
+    sys.argv = _read_object(fp)
+
+    # receive the client PID (FIXME: we don't really use this)
+    remote_pid = _read_object(fp)
+
+    havetty = len(fdidx) != 3
+    if havetty:
+        # Open a new PTY and send it back to our ccontroller process
+        master_fd, slave_fd = os.openpty()
+
+        # send back the master_fd, wait for master to set it up and
+        # acknowledge.
+        socket.send_fds(conn, [ b'm' ], [master_fd])
+        ok = _read_object(fp)
+        assert ok == "OK"
+        os.close(master_fd) # master_fd is with the client now, so we can close it
+
+        # make us the session leader, and make slave_fd our 
+        # controlling terminal and dup it to stdin/out/err
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY)
+
+        # duplicate what's needed
+        debug(f"HERE 1")
+        if STDERR not in fdidx: os.dup2(slave_fd, STDERR); debug(f"{(slave_fd, STDERR)=}")
+        if STDIN  not in fdidx: os.dup2(slave_fd, STDIN); debug(f"{(slave_fd, STDIN)=}")
+        if STDOUT not in fdidx: os.dup2(slave_fd, STDOUT); debug(f"{(slave_fd, STDOUT)=}")
+        debug(f"HERE 2")
 
     # the parent will set up the child's process group and terminal.
     # while that's going on, the child should wait and not execute
@@ -98,6 +124,7 @@ def _spawn(payload, remote_pid, conn, fp):
     if pid == 0:
         os.close(w)			# we'll only be reading
         conn.close()			# we won't be directly communicating to the client
+        if havetty: os.close(slave_fd)
 
         # wait until the parent sets us up
         while not len(os.read(r, 1)):
@@ -110,7 +137,8 @@ def _spawn(payload, remote_pid, conn, fp):
         os.close(r)			# we'll only be writing
         
         os.setpgid(pid, pid)		# start a new process group for the child
-        os.tcsetpgrp(STDIN, pid)	# make the child's the foreground process group (so it receives tty input+signals)
+        if havetty:
+            os.tcsetpgrp(slave_fd, pid)	# make the child's the foreground process group (so it receives tty input+signals)
 
         _write_object(fp, pid)		# send the child's PID back to the client
 
@@ -149,6 +177,7 @@ def _spawn(payload, remote_pid, conn, fp):
                 assert 0, f"weird {status=}"
 
         # the child has exited; clean up and leave
+        if havetty: os.close(slave_fd)
         conn.close()
 
 def _server(preload, payload, timeout=None):
@@ -187,18 +216,9 @@ def _server(preload, payload, timeout=None):
                 # Child process
                 #debug(f"Forked child at {os.getpid()=}")
                 sock.close()
-                fp = conn.makefile(mode='rwb', buffering=0)
+                return _spawn(payload, conn)
 
-                # receive the command line
-                sys.argv = _read_object(fp)
-#                debug(f"{sys.argv=}")
 
-                # receive the client PID (FIXME: we don't really use this)
-                remote_pid = _read_object(fp)
-#                debug(f"{remote_pid=}")
-
-                # Now we fork the process attached to a new pty
-                return _spawn(payload, remote_pid, conn, fp)
             else:
                 conn.close()
 
@@ -222,7 +242,7 @@ def _writen(fd, data):
         n = os.write(fd, data)
         data = data[n:]
 
-def _copy(master_fd, control_fd, control_fp, termios_attr, remote_pid):
+def _copy(master_fd, tty_fd, control_fp, termios_attr, remote_pid):
     """Copy and control loop
     Copies
             pty master -> standard output   (master_read)
@@ -230,11 +250,16 @@ def _copy(master_fd, control_fd, control_fp, termios_attr, remote_pid):
     and also listens for control messages from the child
     on control_fd/fp.
     """
-    fds = [master_fd, STDIN_FILENO, control_fd]
+    control_fd = control_fp.fileno()
+    fds = [ control_fd ]
+    if master_fd is not None: fds.append(master_fd)
+    if tty_fd is not None: fds.append(tty_fd)
+#    debug(f"{fds=} {master_fd=} {tty_fd=}")
     while fds:
         rfds, _wfds, _xfds = select.select(fds, [], [])
 #        debug(f"{rfds=}")
 
+        # received output
         if master_fd in rfds:
             # Some OSes signal EOF by returning an empty byte string,
             # some throw OSErrors.
@@ -246,40 +271,44 @@ def _copy(master_fd, control_fd, control_fp, termios_attr, remote_pid):
 #                debug("CLIENT: zero read on master_fd")
                 fds.remove(master_fd)
             else:
-                os.write(STDOUT_FILENO, data)
+                os.write(tty_fd, data)
 
-        if STDIN_FILENO in rfds:
-            data = os.read(STDIN_FILENO, 1024)
+        # received input
+        if tty_fd in rfds:
+            data = os.read(tty_fd, 1024)
             if not data:
-                fds.remove(STDIN_FILENO)
+                fds.remove(tty_fd)
             else:
                 _writen(master_fd, data)
 
+        # received a control message
         if control_fd in rfds:
             # a control message from the worker. they've
             # paused, exited, etc.
             event, data = _read_object(control_fp)
 #            debug(f"CLIENT: received {event=}")
             if event == "stopped":
-                # it's possible we've been backrounded by the time we got here,
-                # so ignore SIGTTOU while mode-setting. This can happen if someone sent
-                # us (the client) an explicit SIGTSTP.
-                signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-                termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)	# restore tty
-                signal.signal(signal.SIGTTOU, signal.SIG_DFL)
-#                debug("CLIENT: Putting us to sleep")
-#                os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
+                if tty_fd is not None:
+                    # it's possible we've been backrounded by the time we got here,
+                    # so ignore SIGTTOU while mode-setting. This can happen if someone sent
+                    # us (the client) an explicit SIGTSTP.
+                    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+                    termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty
+                    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+#                    debug("CLIENT: Putting us to sleep")
+#                    os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
                 os.kill(0, signal.SIGSTOP)			# put ourselves to sleep
 
                 # this is where we sleep....
                 # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
 
-#                debug("CLIENT: Awake again")
-                tty.setraw(STDIN)					# turn the STDIN raw again
+                if tty_fd is not None:
+# 	             debug("CLIENT: Awake again")
+                    tty.setraw(tty_fd)					# turn the STDIN raw again
 
-                # set terminal size (in case it changed while we slept)
-                s = fcntl.ioctl(STDOUT, termios.TIOCGWINSZ, '\0'*8)
-                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
+                    # set terminal size (in case it changed while we slept)
+                    s = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, '\0'*8)
+                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
 
                 # FIXME: we should message the nanny to do this (pid race condition!)
                 os.killpg(os.getpgid(remote_pid), signal.SIGCONT)	# wake up the worker process
@@ -288,7 +317,8 @@ def _copy(master_fd, control_fd, control_fp, termios_attr, remote_pid):
             elif event == "signaled":
 #                return -1
                 signum = data  # data is the signal that terminated the worker
-                termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
+                if tty_fd is not None:
+                    termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
                 # then restore its default handler and commit a copycat suicide
                 signal.signal(signum, signal.SIG_DFL)
                 os.kill(os.getpid(), signum)
@@ -337,44 +367,71 @@ def _connect(preload, payload, timeout=None):
     client.connect(socket_path)
     fp = client.makefile(mode='rwb', buffering=0)
 
+    # find which one of our STD* descriptors point to the tty.
+    # send non-tty file descriptors directly to the worker. These will
+    # be dup2-ed, rather than manually copied to in the _copy loop.
+
+    pipes = filter(lambda fd: not os.isatty(fd), [STDIN, STDOUT, STDERR])
+    pipes, tty_fd = [], None
+    for fd in [STDIN, STDOUT, STDERR]:
+        if not os.isatty(fd):
+            pipes.append(fd)
+        elif tty_fd is None:
+            ttyname = os.ttyname(fd)
+            debug(f"{ttyname=}")
+            tty_fd = os.open(ttyname, os.O_RDWR)
+
+    debug(f"Non-tty {pipes=}")
+    debug(f"{tty_fd=}")
+    _write_object(fp, pipes)
+    if len(pipes):
+        socket.send_fds(client, [ b'm' ], pipes)
+
     # send our command line
     _write_object(fp, sys.argv)
 
     # send our PID (FIXME: is this necessary?)
     _write_object(fp, os.getpid())
 
-    # get the master_fd of the pty we'll be writing to
-    # set up the initial mode and window size
-    _, (master_fd,), _, _ = socket.recv_fds(client, 10, maxfds=1)
-    termios_attr = termios.tcgetattr(STDIN)
-    termios.tcsetattr(master_fd, termios.TCSAFLUSH, termios_attr)
-    _setwinsize(master_fd, _getwinsize(STDOUT))
-    _write_object(fp, "OK")
+    if tty_fd is not None:
+        # we'll need a pty. the server will create it for us, and we
+        # need to receive and set it up.
+        _, (master_fd,), _, _ = socket.recv_fds(client, 10, maxfds=1)
+        termios_attr = termios.tcgetattr(tty_fd)
+        termios.tcsetattr(master_fd, termios.TCSAFLUSH, termios_attr)
+        _setwinsize(master_fd, _getwinsize(tty_fd))
+        _write_object(fp, "OK")
 
-    # get the PID
+        # set up the SIGWINCH handler which copies terminal window changes
+        # to the pty
+        signal.signal(
+            signal.SIGWINCH,
+            lambda signum, frame: _setwinsize(master_fd, _getwinsize(tty_fd))
+        )
+    else:
+        # no tty, pipes all the way
+        master_fd = termios_attr = None
+
+    # get the child PID
     remote_pid = _read_object(fp)
 
     # pass any signals we receive back to the worker
     _setup_signal_passthrough(remote_pid)
 
-    # set up the SIGWINCH handler which copies terminal window changes
-    # to the pty
-    signal.signal(
-        signal.SIGWINCH,
-        lambda signum, frame: _setwinsize(master_fd, _getwinsize(STDOUT))
-    )
-
+    # Now enter the control loop
     try:
         # switch our input to raw mode
         # See here for _very_ useful info about raw mode:
         #   https://stackoverflow.com/questions/51509348/python-tty-setraw-ctrl-c-doesnt-work-getch
-        tty.setraw(STDIN)
+        if tty_fd is not None:
+            tty.setraw(tty_fd)
 
         # Now enter the communication forwarding loop
-        exitcode = _copy(master_fd, client.fileno(), fp, termios_attr, remote_pid)
+        exitcode = _copy(master_fd, tty_fd, fp, termios_attr, remote_pid)
     finally:
         # restore our console
-        termios.tcsetattr(STDIN, tty.TCSAFLUSH, termios_attr)
+        if tty_fd is not None:
+            termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)
 
     return exitcode
 
