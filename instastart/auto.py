@@ -1,11 +1,37 @@
 # FIXME:
 #  * Do we need to block/unblock signals in signal handlers?
-#  * Full and partial redirect handling
+#  * Transmit/set cwd on 'run'
+#  * Start a new process if key environment variables have changed
+#  * Proper logging
+#  * REPL for debugging the server (?)
 
 import socket, os, sys, array, struct, marshal, tty, fcntl, termios, select, signal
 
+# construct our unique socket name
+def _construct_socket_name():
+    import inspect, hashlib
+
+    # the name of the file at the top of the call stack (should be our main file)
+    pth = inspect.stack()[-1].filename
+    py = sys.executable
+
+    state=f"{pth}-{py}"
+
+    # compute the md5 of the elements that affect the execution environment,
+    # to get something unique.
+    # FIXME: this should also incorporate environ, current python interpreted
+    md5 = hashlib.md5(state.encode('utf-8')).hexdigest()
+
+    # take the filename, w/o the extension
+    fn = pth.split('/')[-1].split('.')[0]
+
+    return os.path.join(os.environ['XDG_RUNTIME_DIR'], f"{fn}.{md5}.socket")
+
 # https://gist.github.com/jmhobbs/11276249
-socket_path = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'echo.socket')
+#socket_path = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'echo.socket')
+socket_path = _construct_socket_name()
+#print(socket_path)
+#sys.exit(0)
 
 STDIN  = STDIN_FILENO  = 0
 STDOUT = STDOUT_FILENO = 1
@@ -62,25 +88,22 @@ def _run_payload(payload):
 
     exit(0)
 
-def _spawn(payload, conn):
+def _spawn(conn, fp):
     #
     # Spawn a child to execute the payload. The parent will
     # stay behind to communicate the child's status to the client.
     #
 
-    # make our life easier & create a file-like object
-    fp = conn.makefile(mode='rwb', buffering=0)
-
     # File descriptors that we should directly dup2-licate
     fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
-    debug(f"{fdidx=}")
+#    debug(f"{fdidx=}")
     if len(fdidx):
         _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=len(fdidx))
     else:
         fds = []
-    debug(f"{fds=}")
+#    debug(f"{fds=}")
     for a, b in zip(fds, fdidx):
-        debug(f"_spawn: duplicating fd {a} to {b}")
+#        debug(f"_spawn: duplicating fd {a} to {b}")
         os.dup2(a, b)
 
     # receive the command line
@@ -107,11 +130,9 @@ def _spawn(payload, conn):
         fcntl.ioctl(slave_fd, termios.TIOCSCTTY)
 
         # duplicate what's needed
-        debug(f"HERE 1")
-        if STDERR not in fdidx: os.dup2(slave_fd, STDERR); debug(f"{(slave_fd, STDERR)=}")
-        if STDIN  not in fdidx: os.dup2(slave_fd, STDIN); debug(f"{(slave_fd, STDIN)=}")
-        if STDOUT not in fdidx: os.dup2(slave_fd, STDOUT); debug(f"{(slave_fd, STDOUT)=}")
-        debug(f"HERE 2")
+        if STDERR not in fdidx: os.dup2(slave_fd, STDERR); #debug(f"{(slave_fd, STDERR)=}")
+        if STDIN  not in fdidx: os.dup2(slave_fd, STDIN); #debug(f"{(slave_fd, STDIN)=}")
+        if STDOUT not in fdidx: os.dup2(slave_fd, STDOUT); #debug(f"{(slave_fd, STDOUT)=}")
 
     # the parent will set up the child's process group and terminal.
     # while that's going on, the child should wait and not execute
@@ -124,15 +145,19 @@ def _spawn(payload, conn):
     if pid == 0:
         os.close(w)			# we'll only be reading
         conn.close()			# we won't be directly communicating to the client
-        if havetty: os.close(slave_fd)
+        if havetty:
+            os.close(slave_fd)		# this has now been duplicated to STD* stream
+        global _client_fp
+        _client_fp = fp
 
         # wait until the parent sets us up
         while not len(os.read(r, 1)):
             pass
         os.close(r)
 
-        # run the payload
-        return _run_payload(payload)
+        # return to __main__ to run the payload
+        #return _run_payload(payload)
+        return
     else:
         os.close(r)			# we'll only be writing
         
@@ -154,10 +179,10 @@ def _spawn(payload, conn):
         #        constantly listen on conn?
         #        Actually, we should do this: https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
         while True:
-            ##debug(f"SENTRY: waitpid on {pid=}")
+#            debug(f"SENTRY: waitpid on {pid=}")
             _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-            ##debug(f"SENTRY: waitpid returned {status=}")
-            ##debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
+#            debug(f"SENTRY: waitpid returned {status=}")
+#            debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
             if os.WIFSTOPPED(status):
                 # let the controller know we've stopped
                 _write_object(fp, ("stopped", 0))
@@ -180,9 +205,14 @@ def _spawn(payload, conn):
         if havetty: os.close(slave_fd)
         conn.close()
 
-def _server(preload, payload, timeout=None):
+def _unlink_socket():
+    # atexit handler registered by _server
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
+
+def _server(timeout=None, readypipe=None):
     # Execute preload code
-    exec(preload)
+##    exec(preload)
 
     # avoid the race condition where two programs are launched
     # at the same time, and try to create the same socket. We'll create
@@ -193,34 +223,56 @@ def _server(preload, payload, timeout=None):
     if os.path.exists(spath):
         os.unlink(spath)
 
+    import atexit
+    atexit.register(_unlink_socket)
+
 #    debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
+        os.fchmod(sock.fileno(), 0o700)		# security: only allow the user to do anything w. the socket
         sock.bind(spath)
         sock.listen()
         os.rename(spath, socket_path)
 #        debug(' done.')
 
-        # Await for client connections
+        if readypipe is not None:
+#            debug('signaling on readypipe')
+            # signal to the reader the server is ready to accept connections
+            os.write(readypipe, b"x")
+            os.close(readypipe)
+#            debug('done')
+
+        # Await for client connections (or server commands)
         while True:
             try:
                 conn, _ = sock.accept()
             except socket.timeout:
                 debug("Server timeout. Exiting")
-                exit(0)
-
+                sys.exit(0)
 #            debug(f"Connection accepted")
-            # connection accepted. Fork a child process to handle the work.
-            pid = os.fork()
-            if pid == 0:
-                # Child process
-                #debug(f"Forked child at {os.getpid()=}")
-                sock.close()
-                return _spawn(payload, conn)
 
+            # make our life easier & create a file-like object
+            fp = conn.makefile(mode='rwb', buffering=0)
 
-            else:
-                conn.close()
+            cmd = _read_object(fp)
+#            debug(f"{cmd=}")
+            if cmd == "stop":
+                # exit the listen loop
+                debug("Server received a command to exit. Exiting")
+                sys.exit(0)
+            elif cmd == "run":
+                # Fork a child process to do the work.
+                pid = os.fork()
+                if pid == 0:
+                    # Child process -- this is where the work gets done
+                    atexit.unregister(_unlink_socket)
+                    sock.close()
+                    return _spawn(conn, fp)
+                else:
+                    conn.close()
+
+    # This function will continue _only_ in the spawned child process,
+    # and execute the main program.
 
 #############################################################################
 #
@@ -254,10 +306,11 @@ def _copy(master_fd, tty_fd, control_fp, termios_attr, remote_pid):
     fds = [ control_fd ]
     if master_fd is not None: fds.append(master_fd)
     if tty_fd is not None: fds.append(tty_fd)
+    import time
 #    debug(f"{fds=} {master_fd=} {tty_fd=}")
     while fds:
         rfds, _wfds, _xfds = select.select(fds, [], [])
-#        debug(f"{rfds=}")
+#        debug(f"{rfds=} {time.time()=}")
 
         # received output
         if master_fd in rfds:
@@ -345,6 +398,7 @@ def _setup_signal_passthrough(remote_pid):
         # the control socket (and can do the same).
         #
         # FIXME: this signaling should be done through the control socket (pid race contitions!)
+#        debug(f"_handle_ISIG: {signum=}")
         os.killpg(os.getpgid(remote_pid), signum)
 
     # forward all signals that make sense to forward
@@ -356,7 +410,7 @@ def _setup_signal_passthrough(remote_pid):
 # Really useful explanation of how SIGTSTP SIGSTOP CTRL-Z work:
 #   https://news.ycombinator.com/item?id=8773740
 #
-def _connect(preload, payload, timeout=None):
+def _connect(timeout=None):
     # try connecting to the UNIX socket. If successful, pass it our command
     # line (argv).  If connection is not successful, start the server.
 #    if not os.path.exists(socket_path):
@@ -366,6 +420,15 @@ def _connect(preload, payload, timeout=None):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(socket_path)
     fp = client.makefile(mode='rwb', buffering=0)
+
+    cmd = os.environ.get("INSTA_CMD", None)
+    if cmd is not None:
+        debug(f"Messaging the server {cmd=}")
+        _write_object(fp, cmd)
+        sys.exit(0)
+
+    # tell the server we want to run a command
+    _write_object(fp, "run")
 
     # find which one of our STD* descriptors point to the tty.
     # send non-tty file descriptors directly to the worker. These will
@@ -378,11 +441,11 @@ def _connect(preload, payload, timeout=None):
             pipes.append(fd)
         elif tty_fd is None:
             ttyname = os.ttyname(fd)
-            debug(f"{ttyname=}")
+#            debug(f"{ttyname=}")
             tty_fd = os.open(ttyname, os.O_RDWR)
 
-    debug(f"Non-tty {pipes=}")
-    debug(f"{tty_fd=}")
+#    debug(f"Non-tty {pipes=}")
+#    debug(f"{tty_fd=}")
     _write_object(fp, pipes)
     if len(pipes):
         socket.send_fds(client, [ b'm' ], pipes)
@@ -435,14 +498,113 @@ def _connect(preload, payload, timeout=None):
 
     return exitcode
 
-def run(module, func):
-    # check if we're already running
-    _server()
+#if __name__ == "__main__":
+#    if os.environ.get("CLIENT", None):
+#        ret = _connect("", "")
+#    else:
+#        ret = _server("import dask.distributed", "print('Hello World!')")
+#
+#    exit(ret)
 
-if __name__ == "__main__":
-    if os.environ.get("CLIENT", None):
-        ret = _connect("", "")
+# re-import main as a module, to trigger the preload
+#if not hasattr(sys.modules['instastart.auto'], "preloaded"):
+#    preloaded = True
+#    print("Hello")
+#    print(sys.modules['__main__'].__file__)
+#    print(dir(sys.modules['__main__']))
+#
+#    # import the main file as a module
+##    from importlib.util import spec_from_loader, module_from_spec
+##    from importlib.machinery import SourceFileLoader 
+##
+##    spec = spec_from_loader("foobar", SourceFileLoader("foobar", "/path/to/foobar"))
+##    foobar = module_from_spec(spec)
+##    spec.loader.exec_module(foobar)
+#
+#else:
+#    print(f"{preloaded=}")
+
+from contextlib import contextmanager
+
+@contextmanager
+def serve():
+    start()
+    
+#    code = 0
+#    try:
+
+    yield
+
+#    except SystemExit as e:
+#        code = e.code
+#        raise
+#    except Exception:
+#        raise
+#        import traceback
+#        print(traceback.format_exc(), file=sys.stderr)
+#        raise
+#    finally:
+#        return
+#        if code is None:
+#            done(0)
+#        elif isinstance(code, int):
+#            done(code)
+#        else:
+#            done(1)
+
+def start():
+    # run the server
+#    print("Spinning up the server... {_w=}")
+    timeout = os.environ.get("INSTA_TIMEOUT", 10)
+    _server(timeout=timeout, readypipe=_w)
+
+def done(exitcode=0):
+    # Flush the output back to the client
+    if not sys.stdout.closed: sys.stdout.flush()
+    if not sys.stderr.closed: sys.stderr.flush()
+    
+    # signal the client we've finished, and that it should
+    # move on.
+    #
+    # FIXME: HACK: This is a _HUGE_ hack, introducing a race condition w. the sentry process.
+    #              only the sentry should ever be talking to _client_fp; we should
+    #              have a pipe back to the sentry instead.
+    global _client_fp
+    _write_object(_client_fp, ("exited", exitcode))
+
+# Check if we have a server running. If not, spawn one.
+if not os.path.exists(socket_path):
+    _r, _w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(_r)
+        # child -- this is what will become the server. Just fall through
+        # the code, to be caught in start(). This will launch the
+        # server, setting up its socket, etc., and signaling we're ready by
+        # writing to _r pipe.
+
+        # start a new session (for daemonization)
+        os.setsid()
+        
+        # now fall through until we hit start() somewhere in __main__
+        pass
     else:
-        ret = _server("import dask.distributed", "print('Hello World!')")
+        os.close(_w)
+        # parent -- we'll wait for the server to become available, then
+        # connect to it.
+#        print(f"Awaiting a signal at {socket_path=}")
+        while True:
+            msg = os.read(_r, 1)
+#            debug(msg)
+            if len(msg):
+                break
+        os.close(_r)
+#        print(f"Signal received!")
 
-    exit(ret)
+# Connect to the server, assuming we have it running
+if os.path.exists(socket_path):
+    # the server should now be running; connect to it
+#    debug(f"Connecting to server at {socket_path=}")
+    ret = _connect()
+#    debug("Done")
+    sys.exit(ret)
