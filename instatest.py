@@ -1,6 +1,8 @@
-import instastart.auto
+from instastart.auto import start, done
 
 import dask.distributed as dd
+#import astropy
+#import vaex
 import os
 
 def func():
@@ -22,11 +24,13 @@ def tqdm_echo():
     print("Exiting tqdm_echo")
 
 if __name__ == "__main__":
-    instastart.auto.start()
+    start()
 
+    print("Here!")
 #    tqdm_echo()
+#    os.execl('/usr/bin/htop', 'htop')
 
-    instastart.auto.done()
+    done()
     pass
 #        os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
 #        print(f"{__file__=}")

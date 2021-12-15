@@ -1,9 +1,10 @@
 # FIXME:
 #  * Do we need to block/unblock signals in signal handlers?
+#  * Try connecting to a socket, create one if fail
 #  * Transmit/set cwd on 'run'
 #  * Start a new process if key environment variables have changed
 #  * Proper logging
-#  * REPL for debugging the server (?)
+#  * Tests
 
 import socket, os, sys, array, struct, marshal, tty, fcntl, termios, select, signal
 
