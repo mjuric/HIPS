@@ -9,11 +9,12 @@ def func():
     pass
 
 import time, tqdm, sys
-def tqdm_echo():
+def run_tqdm():
     for _ in tqdm.tqdm(range(20)):
         time.sleep(0.1)
     print("Out of the loop")
-    return
+
+def run_echo():
     try:
         for line in sys.stdin:
             print("ECHO:", line, end='')
@@ -31,7 +32,7 @@ if __name__ == "__main__":
     print(f"{os.getcwd()=}")
     print(f"{os.environ['PWD']=}")
     print(f"{os.environ.get('FOOBAR', None)=}")
-#    tqdm_echo()
+    run_tqdm()
 #    os.execl('/usr/bin/htop', 'htop')
 
     done()

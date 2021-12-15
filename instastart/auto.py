@@ -596,12 +596,18 @@ def _fork_and_wait_for_server():
     pid = os.fork()
     if pid == 0:
         os.close(_r)
+        import setproctitle
+        name = sys.argv[0].split('/')[-1]
+        setproctitle.setproctitle(f"[instastart: {name}]")
+
         # child -- this is what will become the server. Just fall through
         # the code, to be caught in start(). This will launch the
         # server, setting up its socket, etc., and signaling we're ready by
         # writing to _r pipe.
 
-        # start a new session (for daemonization)
+        # start a new session, to protect the child from SIGHUPs, etc.
+        # we don't double-fork as the daemon never really does anything
+        # funny with the tty (TODO: should we still double-fork, just in case?)
         os.setsid()
 
         # now fall through until we hit start() somewhere in __main__
