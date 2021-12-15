@@ -1,9 +1,154 @@
 # FIXME:
 #  * Do we need to block/unblock signals in signal handlers?
+#  * Sane default for systems w/o XDG_RUNTIME_DIR (macOS)
 #  * Proper logging
 #  * Tests
+#
+# # Instastart: Easy prewarming Python processes for fast startup
+#
+#  Rough flow diagram:
+#
+#    <<client>>
+#        |
+#        | ---> contact server on UNIX socket...fail (doesn't exist)
+#        |
+#        | -----------> fork <<server>>
+#        |                       |
+#        | ---> "cmd=run" -----> |
+#        |                       | ---> fork <<sentry>>
+#        |                       :               | (alloc pty)
+#        | ---> argv + cwd + environ + fds ----> |
+#        |                       :               |  ---> fork <<worker>>
+#        |                       :               :                |
+#        | ------------- stdin/signals/pty control -------------> |
+#        | <------------------- stdout/stderr ------------------- |
+#        |                       :               :
+#        | <--------- waitpid() results -------- |
+#                                :
+#                                o exit after idle timeout
+#
+#  * server: the pre-warmed process that stick around in the background,
+#            ready to fork a child to do the work
+#  * worker: the process doing the actual, useful, work. I.e., the thing
+#            that would be done w/o instastart.
+#  * sentry: the process that watches over the worker, receives and
+#            forwards the notifications that the worker has stopped or
+#            has exited. A session leader for the worker's pty.
+#            Plays the role of a quasi-shell process for the worker.
+#  * client: the process the user launches, which has the server fork a
+#            child doing the real work and proxies keyboard/signals back to
+#            the child
+#
+#  The sequence begins by the user launching a client on the command line. 
+#  Usually the very first thing the client does it to import
+#  instastart.auto, i.e.:
+#
+#     import instastart.auto
+#
+#  This module contains the code that makes the client attempt to connect to
+#  the server via a named UNIX socket stored on a well-known path (usually
+#  in $XDG_RUNTIME_DIR).  The name of the socket is unique to the
+#  combination of the path of the executable script, the python interpreter,
+#  and the contents of PYTHONPATH.  If no such socket exists, or if the
+#  connection is unsuccessful, instastart.auto module code forks a server
+#  process.
+#
+#  This server process then returns from the import statement, and continues
+#  running the client's code (presumably some heavy imports and one-time
+#  computations, until it reaches an invocation of instastart.auto.start().
+#  For example:
+#
+#     import instastart.auto
+#
+#       ... heavy imports, dask.distributed, vaex, astropy etc ...
+#
+#     if __name__ == "__main__":
+#         instastart.auto.start()
+#         ... code to run ...
+#
+#  This function serves as a barrier -- at this point, the server stops
+#  execution, binds to the named UNIX socket, and begins listening for
+#  connections.  The big idea is that subsequent client connections will
+#  cause the server to fork a worker and simply return from
+#  instastart.auto.start(), continuing to run (from the users' code
+#  perspective) as if nothing happened -- now skipping all the costly
+#  initialization part. I.e., we've effectivelly "pre-warmed" Python VM w.
+#  plus our modules of interest. The implementation details are a bit more
+#  complicated, as discussed next.
+#
+#  With the server now forked and awaiting connections, the client can
+#  connect to it and request to run a command.  The server reacts by first
+#  forking a sentry process.  This process serves as a quasi-shell for the
+#  actual worker process (to be forked next), and is necessary to receive
+#  signals about worker's state as well as manage it's pseudo-terminal
+#  (pty).  Once the sentry is forked, the client sends it the specs of the
+#  command to run -- at least the argv, cwd, and environ. These will be
+#  modified once the worker is forked to match the client's environment
+#  (i.e., to make the worker's internal state as close to the client's as
+#  possible).
+#
+#  If any of the client's stdin/out/err are pipes (i.e., I/O was
+#  redirected), the client sends those file descriptors over as well -- they
+#  will be dup2-ed directly to the worker (see below), making for truly
+#  zero-overhead IO.  If at least one of the client's stdin/out/err are
+#  connected to a tty, the sentry allocates a pty for the worker & becomes
+#  its session leader.  It then sends back the pty master file descriptor
+#  (master_fd) to the client, who uses it to replicate the properties of the
+#  local terminal (most importantly, the window size).  That way the worker
+#  process will "feel" as if it's running on exactly the same tty as the
+#  client.  After the client sets up the pty, the sentry finally forks the
+#  worker, moves it into its own process group, sets it as the pty's
+#  foreground process, and sends the worker pid back to the client.
+#
+#  This worker process is finally allowed to return from
+#  instastart.auto.start() and continue executing useful code -- from the
+#  point of view of Python code, instastart.auto.start() just took a while
+#  to return.  The worker's I/O is connected to the pty which the client
+#  controls (or to the duplicated file descriptors).  The client
+#  communicates with the worker by polling master_fd (the worker's pty
+#  master end that the sentry sent back) for any output, and its own STDIN
+#  for any input.  The client reads the output from master_fd and writes it
+#  to its own terminal.  Similarly, the client reads input from its own
+#  terminal and writes it to master_fd.  While not zero, these are fairly
+#  low-overhead operations.  The sentry stays on, waitpid()-ing on the
+#  worker, and passing back to the client any messages on the worker exiting
+#  or stopping (i.e., SIGSTOP).
+#
+#  One tricky aspect is the handling of signals and special characters. The
+#  client's tty is set to raw mode so no special characters (^C, ^Z, etc..)
+#  are interpreted on the client side; they're all read and written to the
+#  worker's tty (who can then react to them as programmed).  Some of those
+#  characters can cause the worker to stop or exit.  The client polls the
+#  control connection to the sentry for notifications of those, and replays
+#  them on itself (i.e., sends itself a signal with same exit code, or stops
+#  itself if the worker has stopped).  For example, if a user types ^Z, the
+#  following (typically) happens: ^Z (ASCII 26) is read from the client's
+#  STDIN and written to master_fd.  The client pty's line discipline
+#  (assuming the pty is in cooked mode) sees ^Z and sends a SIGTSTP to the
+#  foreground process -- the worker.  The worker reacts (by default) by
+#  sending itself a SIGSTOP and going to sleep.  The sentry's waitpid()
+#  returns, with WIFSTOPPED(status)==true.  The sentry sends a message back
+#  to the client (via the control socket) that the worker has gone to sleep. 
+#  The client receives the message, restores its own tty to original
+#  (usually cooked) mode, and sends itself a SIGTSTP, which finally puts it
+#  to sleep.  Though the signal route is circuitous, from the user's
+#  perspective it all looks good: they've hit ^Z, and the client has gone to
+#  sleep (i.e., exactly the same behavior as if there were no client/server
+#  split).
+#
+#  Signals are also proxied from the client to the worker. We install a
+#  signal handler on the client for all signals (but a few that wouldn't
+#  make sense to proxy -- e.g., SIGCHLD) and pass them on to the worker
+#  (i.e.  killpg(worker_pid, signum)).  This makes the client process look
+#  and feel even more as if it were the actual worker.  E.g., if used in
+#  bash scripts, etc.  -- killing it with anything but SIGKILL produces the
+#  same effect as killing the underlying worker.  SIGWINCH is handhled
+#  differently -- it's caught, the new terminal window size is read, and
+#  written to the worker pty's master_fd (which causes the pty to trigger
+#  SIGWINCH on the worker, which can then handle the window size change).
+#
 
-import socket, os, sys, array, struct, marshal, tty, fcntl, termios, select, signal
+import socket, os, sys, marshal, tty, fcntl, termios, select, signal
 
 # construct our unique socket name
 def _construct_socket_name():
@@ -26,20 +171,19 @@ def _construct_socket_name():
 
     return os.path.join(os.environ['XDG_RUNTIME_DIR'], f"{fn}.{md5}.socket")
 
-# https://gist.github.com/jmhobbs/11276249
-#socket_path = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'echo.socket')
 socket_path = _construct_socket_name()
-#print(socket_path)
-#sys.exit(0)
 
-STDIN  = STDIN_FILENO  = 0
-STDOUT = STDOUT_FILENO = 1
-STDERR = STDERR_FILENO = 2
+# Helpful constants
+STDIN  = 0
+STDOUT = 1
+STDERR = 2
 
+# our own fast-ish logging routines
+# (importing logging seems to add ~15msec to runtime, tested on macOS/MBA)
+#
 def debug(*argv, **kwargs):
     kwargs['file'] = sys.stderr
     return print(*argv, **kwargs)
-
 
 #############################################################################
 #
@@ -60,32 +204,10 @@ def _setwinsize(fd, winsz):
     return fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
 
 #############################################################################
-
-def _run_payload(payload):
-    print("Welcome to my echo chamber!")
-#    os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
-#    os.execl("/usr/bin/vim", "vim")
-#    os.execl("/usr/bin/sleep", "sleep", "600")
-#    os.execl("/usr/bin/stty", "stty", "-a")
-
-    import time, tqdm
-    for _ in tqdm.tqdm(range(100)):
-        time.sleep(0.1)
-#        debug("#", end='', flush=True)
-    for line in sys.stdin:
-        print("ECHO:", line, end='')
-        debug("RECEIVED:", line, end='')
-    debug("Exiting.")
-    exit(0)
-
-    #conn.send(f"Hello from child at {os.getpid()=}\n".encode('utf-8'))
-    # TODO: launch a dameon thread to receive messages over the control socket
-    # This is how we'll receive screen resize mesages, etc., in the future.
-
-#    print("Executing payload")
-    exec(payload)
-
-    exit(0)
+#
+#   Child spawner
+#
+#############################################################################
 
 def _spawn(conn, fp):
     #
@@ -164,9 +286,12 @@ def _spawn(conn, fp):
         os.close(r)
 
         # return to __main__ to run the payload
-        #return _run_payload(payload)
         return
     else:
+        # change name to denote we're the sentry
+        #import setproctitle
+        #setproctitle.setproctitle(f"{' '.join(sys.argv)} [sentry for {pid=}]")
+
         os.close(r)			# we'll only be writing
         
         os.setpgid(pid, pid)		# start a new process group for the child
