@@ -1,8 +1,5 @@
 # FIXME:
 #  * Do we need to block/unblock signals in signal handlers?
-#  * Try connecting to a socket, create one if fail
-#  * Transmit/set cwd on 'run'
-#  * Start a new process if key environment variables have changed
 #  * Proper logging
 #  * Tests
 
@@ -15,8 +12,9 @@ def _construct_socket_name():
     # the name of the file at the top of the call stack (should be our main file)
     pth = inspect.stack()[-1].filename
     py = sys.executable
+    env = "PYTHONPATH=" + os.environ.get("PYTHONPATH",'')
 
-    state=f"{pth}-{py}"
+    state=f"{pth}-{py}-{env}"
 
     # compute the md5 of the elements that affect the execution environment,
     # to get something unique.
@@ -95,6 +93,18 @@ def _spawn(conn, fp):
     # stay behind to communicate the child's status to the client.
     #
 
+    # receive the command line
+    sys.argv = _read_object(fp)
+    
+    # receive the cwd (and change to it)
+    cwd = _read_object(fp)
+    os.chdir(cwd)
+
+    # receive the environment
+    env = _read_object(fp)
+    os.environ.clear()
+    os.environ.update(env)
+
     # File descriptors that we should directly dup2-licate
     fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
 #    debug(f"{fdidx=}")
@@ -106,9 +116,6 @@ def _spawn(conn, fp):
     for a, b in zip(fds, fdidx):
 #        debug(f"_spawn: duplicating fd {a} to {b}")
         os.dup2(a, b)
-
-    # receive the command line
-    sys.argv = _read_object(fp)
 
     # receive the client PID (FIXME: we don't really use this)
     remote_pid = _read_object(fp)
@@ -436,10 +443,18 @@ def _connect(timeout=None):
     # tell the server we want to run a command
     _write_object(fp, "run")
 
+    # send our command line
+    _write_object(fp, sys.argv)
+
+    # send cwd
+    _write_object(fp, os.getcwd())
+
+    # send environment
+    _write_object(fp, os.environ.copy())
+
     # find which one of our STD* descriptors point to the tty.
     # send non-tty file descriptors directly to the worker. These will
     # be dup2-ed, rather than manually copied to in the _copy loop.
-
     pipes = filter(lambda fd: not os.isatty(fd), [STDIN, STDOUT, STDERR])
     pipes, tty_fd = [], None
     for fd in [STDIN, STDOUT, STDERR]:
@@ -455,9 +470,6 @@ def _connect(timeout=None):
     _write_object(fp, pipes)
     if len(pipes):
         socket.send_fds(client, [ b'm' ], pipes)
-
-    # send our command line
-    _write_object(fp, sys.argv)
 
     # send our PID (FIXME: is this necessary?)
     _write_object(fp, os.getpid())
@@ -591,7 +603,7 @@ def _fork_and_wait_for_server():
 
         # start a new session (for daemonization)
         os.setsid()
-        
+
         # now fall through until we hit start() somewhere in __main__
         pass
     else:

@@ -27,6 +27,10 @@ if __name__ == "__main__":
     start()
 
     print("Here!")
+    print(f"{sys.argv=}")
+    print(f"{os.getcwd()=}")
+    print(f"{os.environ['PWD']=}")
+    print(f"{os.environ.get('FOOBAR', None)=}")
 #    tqdm_echo()
 #    os.execl('/usr/bin/htop', 'htop')
 
