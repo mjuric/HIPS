@@ -14,19 +14,77 @@
 #  startup times from 1-10 seconds to ~70 milliseconds, making the command
 #  line code pleasent to use (and fast to use in shell scripts).
 #
+# ## Quick start
+#
+#  $ cat slow.py
+#  import dask.distributed
+#  import astropy
+#    
+#  if __name__ == "__main__":
+#      print("Hello world!")
+#
+#  $ time python slow.py
+#  Hello world!
+#
+#  real    0m2.087s
+#  user    0m2.607s
+#  sys     0m11.124s
+#
+#  $ cat fast.py
+#  from instastart.auto import start, done
+#  import dask.distributed
+#  import astropy
+#  
+#  if __name__ == "__main__":
+#      start()
+#      print("Hello world!")
+#      done()
+#
+#  $ time python fast.py
+#  Hello world!
+#  
+#  real    0m0.098s
+#  user    0m0.063s
+#  sys     0m0.014s
+#
 # ## Implementation
 #
-#  An ideal implementation would be one where a pre-warmed server process
-#  awaits in the background, and when a new invocation is launched it
-#  somehow forks the pre-warmed server and replaces itself w. the forked
-#  child (while maintaining the pid, etc.). It would also work if it could
-#  reparent the server's child to itself (and bind it to its own terminal).
-#  Alas, neither of those options are allowed on typical UNIX systems (and
-#  for good reasons). So we have to take a different tack: have the new
-#  invocation (which we'll call the "client") act as a /transparent proxy/
-#  -- shutling input, output, and signals -- between the user and the
-#  "worker" which has been forked from the server and does the actual work.
-#  Below we discuss how this is done.
+#  Two core ideas are at the center of this package:
+#
+#    1. An observation that the slow startup time of many Python codes is
+#       due to costly, one-time, unchanging, initialization -- specifically
+#       imports of large modules.  If there was a way to do this
+#       initialization just once, then (quickly) copy the state of the
+#       initialized interpreter for subsequent runs, we'd dramatically cut
+#       down on the total startup time.
+#
+#    2. The fact that UNIX systems provide a way to do something like the
+#       above, using the fork(2) system call (e.g., see the man page at
+#       https://man7.org/linux/man-pages/man2/fork.2.html).  fork() allows
+#       one to duplicate (aka "fork") a running process (program).  If we
+#       could find a clever way to pause a Python program after it's
+#       finished the (costly) initialization, and then fork() from that
+#       state the next time it's invoked, we could achieve our goal of
+#       cutting down the startup times.
+#
+#  This techique is sometimes known as "pre-warming". An ideal
+#  implementation would be one where a pre-warmed server process awaits in
+#  the background.  When a new invocation is launched, it forks the
+#  pre-warmed server and replaces itself w.  the forked child process (while
+#  maintaining the process ID -- the pid, etc.).  This way the result would
+#  seem nearly 100% identical to non-prewarmed runs, from the point of view
+#  of the shell and other programs.  It would also work if one could
+#  "reparent" the server's child to the subsequent invocation (and bind it
+#  to its own terminal).  Alas, neither of those options are allowed on
+#  typical UNIX systems (and for good reasons).
+#
+#  So we have to take a different tack: have the new invocation (which we'll
+#  -- call the "client") act as a /transparent proxy/ shutling input,
+#  output, and signals between the user and the "worker", the process forked
+#  from the server that does the actual work.  This is what instastart does. 
+#  Below we discuss how.
+#
+# ## Gory details
 #
 #  Figure 1. A diagram of a typical execution (first run):
 #
