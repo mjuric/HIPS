@@ -418,8 +418,13 @@ def _connect(timeout=None):
 #        return _server(preload, payload, timeout)
 
     # try connecting
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.connect(socket_path)
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(socket_path)
+    except (FileNotFoundError, ConnectionRefusedError):
+        # connection failed; return None
+        return None
+
     fp = client.makefile(mode='rwb', buffering=0)
 
     cmd = os.environ.get("INSTA_CMD", None)
@@ -573,8 +578,8 @@ def done(exitcode=0):
     global _client_fp
     _write_object(_client_fp, ("exited", exitcode))
 
-# Check if we have a server running. If not, spawn one.
-if not os.path.exists(socket_path):
+def _fork_and_wait_for_server():
+    global _w
     _r, _w = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -591,8 +596,7 @@ if not os.path.exists(socket_path):
         pass
     else:
         os.close(_w)
-        # parent -- we'll wait for the server to become available, then
-        # connect to it.
+        # parent -- we'll wait for the server to become available, then connect to it.
 #        print(f"Awaiting a signal at {socket_path=}")
         while True:
             msg = os.read(_r, 1)
@@ -601,11 +605,30 @@ if not os.path.exists(socket_path):
                 break
         os.close(_r)
 #        print(f"Signal received!")
+    return pid
 
-# Connect to the server, assuming we have it running
-if os.path.exists(socket_path):
-    # the server should now be running; connect to it
-#    debug(f"Connecting to server at {socket_path=}")
+def _connect_or_serve():
+    # try connecting on our socket; if fail, spawn a new server
+
+    # try connecting
     ret = _connect()
-#    debug("Done")
-    sys.exit(ret)
+    if ret is not None:
+        sys.exit(ret)
+
+    # fork the server. This will return pid or 0, depending on if it's
+    # child or parent
+    if _fork_and_wait_for_server() != 0:
+        # parent (== client)
+
+        # try connecting again
+        ret = _connect()
+        if ret is not None:
+            sys.exit(ret)
+        else:
+            raise Exception("Uh-oh... Failed to connect to instastart background process!")
+    else:
+        # this will fall through the code until, running all code that
+        # should be prewarmed until it's paused in start()
+        pass
+
+_connect_or_serve()
